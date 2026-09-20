@@ -1,0 +1,50 @@
+# LGU Attendance — production-shaped compose.
+# db (5440) + api (4100) internal; only web:80 publishes (nginx proxies /api).
+# Local dev: `docker compose up -d db` then run backend/frontend with npm run dev.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: lgu_attendance
+    ports:
+      - "5440:5432"   # published: local dev + migrations reach it on localhost:5440
+      # (5433 collides with a native Postgres on this host — see git log)
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d lgu_attendance"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/lgu_attendance?schema=public
+      PORT: "4100"
+      NODE_ENV: production
+      JWT_SECRET: ${JWT_SECRET:-change-me-to-a-long-random-string}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-change-me-too}
+      WEB_ORIGIN: ${WEB_ORIGIN:-}
+      HRMS_BASE_URL: ${HRMS_BASE_URL:-}
+      HRMS_API_KEY: ${HRMS_API_KEY:-}
+      HRMS_WEBHOOK_SECRET: ${HRMS_WEBHOOK_SECRET:-}
+      HRMS_SYNC_POLLER: ${HRMS_SYNC_POLLER:-0}
+      HRMS_SYNC_INTERVAL_MIN: ${HRMS_SYNC_INTERVAL_MIN:-15}
+      INTEGRATION_ALLOWED_IPS: ${INTEGRATION_ALLOWED_IPS:-}
+      TRUST_PROXY: "1"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web:
+    build: ./frontend
+    ports:
+      - "5180:80"
+    depends_on:
+      - api
+
+volumes:
+  db-data:

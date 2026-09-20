@@ -1,0 +1,324 @@
+// LGU Attendance — Prisma schema.
+// Conventions mirror LGU-HRMS: uuid ids, Timestamptz(6), soft delete via
+// deletedAt, Decimal(12,2) money, dates stored UTC (Manila-day helpers in
+// src/lib/time.js), statuses as enums (single source of truth).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum EmploymentStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum AttendanceStatus {
+  PRESENT
+  LATE
+  UNDERTIME
+  HALF_DAY
+  ABSENT
+  ON_LEAVE
+}
+
+enum AttendanceSource {
+  MANUAL
+  PUNCH
+  DEVICE
+  IMPORT
+  HRMS
+}
+
+enum LeaveType {
+  VACATION
+  SICK
+  EMERGENCY
+  MATERNITY
+  PATERNITY
+  SOLO_PARENT
+  OTHER
+}
+
+enum LeaveStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+enum Role {
+  ADMIN
+  HR_MANAGER
+  DEPARTMENT_HEAD
+  AUDITOR
+  VIEWER
+}
+
+enum SyncSource {
+  WEBHOOK
+  POLL
+}
+
+enum SyncDirection {
+  INBOUND
+  PULL
+}
+
+enum SyncStatus {
+  SUCCESS
+  PARTIAL
+  FAILED
+}
+
+model User {
+  id           String     @id @default(uuid())
+  username     String     @unique
+  passwordHash String
+  fullName     String
+  role         Role       @default(VIEWER)
+  status       String     @default("ACTIVE")
+  /// Links a user account to an Employee (employeeNumber) for self-service
+  /// attendance punching. NULL for role-only accounts (admin/hr_manager/...).
+  externalId   String?    @unique
+  createdAt    DateTime   @default(now()) @db.Timestamptz(6)
+  updatedAt    DateTime   @updatedAt @db.Timestamptz(6)
+  auditLogs    AuditLog[]
+}
+
+/// Employee roster mirrored from LGU-HRMS via webhooks (real-time push) and
+/// scheduled polling (fallback). hrmsId = HRMS employeeId from payloads;
+/// employeeNumber is the join key (HRMS User.externalId convention).
+model Employee {
+  id             String           @id @default(uuid())
+  hrmsId         String?
+  employeeNumber String           @unique
+  firstName      String
+  lastName       String
+  middleName     String?
+  email          String?
+  department     String?
+  position       String?
+  status         EmploymentStatus @default(ACTIVE)
+  hiredDate      DateTime?        @db.Date
+  monthlySalary  Decimal          @default(0) @db.Decimal(12, 2)
+  syncSource     String           @default("MANUAL")
+  lastSyncedAt   DateTime?        @db.Timestamptz(6)
+  createdAt      DateTime         @default(now()) @db.Timestamptz(6)
+  updatedAt      DateTime         @updatedAt @db.Timestamptz(6)
+  deletedAt      DateTime?        @db.Timestamptz(6)
+
+  attendanceRecords AttendanceRecord[]
+  leaveRequests     LeaveRequest[]
+  biometricCredentials BiometricCredential[]
+
+  @@index([status])
+  @@index([department])
+  @@index([hrmsId])
+}
+
+/// One record per employee per day (unique [employeeId, date]) — the shape
+/// reports aggregate over. Status/late/undertime computed from AttendanceRule
+/// (defaults 08:00-17:00, 12:00-13:00, 15m grace) by attendanceService.
+model AttendanceRecord {
+  id               String           @id @default(uuid())
+  employeeId       String
+  date             DateTime         @db.Date
+  timeIn           DateTime?        @db.Timestamptz(6)
+  timeOut          DateTime?        @db.Timestamptz(6)
+  hours            Float?
+  status           AttendanceStatus @default(PRESENT)
+  minutesLate      Int              @default(0)
+  undertimeMinutes Int              @default(0)
+  source           AttendanceSource @default(MANUAL)
+  deviceRef        String?
+  /// Self-service punch locations (navigator.geolocation): { lat, lng, accuracy }
+  /// captured at clock-in and clock-out. Geofence validation happens in
+  /// attendanceService.punch() when office coordinates are configured.
+  geoIn            Json?
+  geoOut           Json?
+  remarks          String?
+  createdAt        DateTime         @default(now()) @db.Timestamptz(6)
+  updatedAt        DateTime         @updatedAt @db.Timestamptz(6)
+
+  employee Employee @relation(fields: [employeeId], references: [id])
+
+  @@unique([employeeId, date])
+  @@index([date])
+  @@index([employeeId, status])
+}
+
+/// Raw device punches mirrored from HRMS biometric hardware via the
+/// biometric.punch / biometric.punch_batch webhook events. Append-only audit
+/// log; the authoritative daily shape is AttendanceRecord (one row per
+/// employee/day), produced by pairing IN/OUT + deriving status/hours in
+/// attendanceService.ingestBiometricPunches().
+model BiometricPunch {
+  id             String           @id @default(uuid())
+  employeeNumber String
+  date           DateTime         @db.Date
+  eventTime      DateTime         @db.Timestamptz(6)
+  direction      String           @default("AUTO")
+  deviceRef      String?
+  source         AttendanceSource @default(DEVICE)
+  createdAt      DateTime         @default(now()) @db.Timestamptz(6)
+
+  @@index([employeeNumber, date])
+  @@index([eventTime])
+}
+
+/// Biometric time-clock terminals this application serves as the configuration
+/// host for. Devices authenticate with a Bearer token (sha256 hashed at rest,
+/// shown once at registration). Registered devices push raw IN/OUT punches to
+/// POST /biometric/:deviceId/punches; punches are paired into AttendanceRecord
+/// locally and forwarded to HRMS for computation (HRMS_ATTENDANCE_FORWARD=1).
+model BiometricDevice {
+  id          String    @id @default(uuid())
+  deviceId    String    @unique
+  name        String
+  secretHash  String    @unique
+  model       String?
+  ip          String?
+  active      Boolean   @default(true)
+  lastSeenAt  DateTime? @db.Timestamptz(6)
+  createdAt   DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt   DateTime  @updatedAt @db.Timestamptz(6)
+
+  @@index([active])
+}
+
+/// Late/undertime rules. active+isDefault selects the rule attendanceService
+/// applies when computing a punch (single default row seeded).
+model AttendanceRule {
+  id             String   @id @default(uuid())
+  name           String   @unique
+  workStartMins  Int      @default(480)
+  workEndMins    Int      @default(1020)
+  lunchStartMins Int      @default(720)
+  lunchEndMins   Int      @default(780)
+  graceMinutes   Int      @default(15)
+  /// Office anchor for punch geofencing. When officeLat/officeLng are null the
+  /// geofence is disabled (punches accepted without location). Runtime config
+  /// via Settings > Attendance (PATCH /attendance/rule/geofence); env
+  /// OFFICE_LAT/OFFICE_LNG/GEOFENCE_RADIUS_M/MAX_ACCURACY_M only provision the
+  /// seed default.
+  officeLat          Float?
+  officeLng          Float?
+  geofenceRadiusM    Float?
+  maxAccuracyM       Float?
+  active         Boolean  @default(true)
+  isDefault      Boolean  @default(false)
+  createdAt      DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt      DateTime @updatedAt @db.Timestamptz(6)
+}
+
+model LeaveRequest {
+  id         String      @id @default(uuid())
+  employeeId String
+  /// HRMS-side leave id — join key for leave.created/updated/deleted webhooks.
+  hrmsId     String?     @unique
+  type       LeaveType   @default(VACATION)
+  startDate  DateTime    @db.Date
+  endDate    DateTime    @db.Date
+  status     LeaveStatus @default(PENDING)
+  reason     String?
+  approvedBy String?
+  approvedAt DateTime?   @db.Timestamptz(6)
+  createdAt  DateTime    @default(now()) @db.Timestamptz(6)
+  updatedAt  DateTime    @updatedAt @db.Timestamptz(6)
+
+  employee Employee @relation(fields: [employeeId], references: [id])
+
+  @@index([employeeId, status])
+  @@index([startDate, endDate])
+}
+
+model Holiday {
+  id   String   @id @default(uuid())
+  date DateTime @unique @db.Date
+  name String
+}
+
+/// Every HRMS sync is recorded here (mirrors HRMS SyncRequest pattern):
+/// webhook receipts (INBOUND) and scheduled/manual roster pulls (PULL).
+model SyncLog {
+  id        String        @id @default(uuid())
+  source    SyncSource    @default(POLL)
+  direction String        @default("PULL")
+  event     String?
+  status    SyncStatus    @default(SUCCESS)
+  processed Int           @default(0)
+  message   String?
+  payload   Json?
+  createdAt DateTime      @default(now()) @db.Timestamptz(6)
+
+  @@index([createdAt])
+  @@index([status])
+}
+
+/// In-app HRMS connection config (Settings > Integration). A saved row takes
+/// precedence over env; empty fields fall back to env. Secrets are AES-GCM
+/// encrypted at rest (see lib/secrets.js) and never returned by the API.
+model IntegrationConfig {
+  id                   String   @id @default("default")
+  hrmsBaseUrl          String?
+  hrmsApiKeyEnc        String?
+  hrmsWebhookSecretEnc String?
+  pollerEnabled        Boolean  @default(false)
+  intervalMin          Int      @default(15)
+  timeoutMs            Int      @default(15000)
+  ingestPath           String   @default("/integrations/attendance")
+  forwardingEnabled    Boolean  @default(false)
+  createdAt            DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt            DateTime @updatedAt @db.Timestamptz(6)
+}
+
+/// Append-only audit trail for mutating requests (global audit middleware).
+/// HRMS-driven changes are traced via SyncLog instead (no local actor).
+model AuditLog {
+  id        String   @id @default(uuid())
+  userId    String?
+  action    String
+  entity    String
+  entityId  String
+  before    Json?
+  after     Json?
+  ip        String?
+  error     Boolean  @default(false)
+  timestamp DateTime @default(now()) @db.Timestamptz(6)
+  user      User?    @relation(fields: [userId], references: [id])
+
+  @@index([timestamp])
+}
+
+/// Machine consumer keys (e.g. HRMS payroll pulling attendance reports).
+/// Bearer keys, sha256-hashed at rest, scope-checked by requireApiKey().
+model ApiKey {
+  id         String    @id @default(uuid())
+  name       String
+  prefix     String
+  keyHash    String    @unique
+  scopes     String[]
+  active     Boolean   @default(true)
+  lastUsedAt DateTime? @db.Timestamptz(6)
+  createdAt  DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt  DateTime  @updatedAt @db.Timestamptz(6)
+}
+
+model BiometricCredential {
+  id           String    @id @default(uuid())
+  employeeId   String
+  credentialId String    @unique
+  publicKey    String
+  counter      Int       @default(0)
+  deviceName   String?
+  enrolledAt   DateTime  @default(now()) @db.Timestamptz(6)
+  lastUsedAt   DateTime? @db.Timestamptz(6)
+  employee     Employee  @relation(fields: [employeeId], references: [id])
+
+  @@index([employeeId])
+}

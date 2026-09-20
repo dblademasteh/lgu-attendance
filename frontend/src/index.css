@@ -1,0 +1,540 @@
+@import 'tailwindcss';
+
+/* ============================================================
+   LGU Attendance Design Tokens — mirrors the LGU-HRMS token system
+   (same palette/typography so the two systems feel like one suite).
+   See lgu-hrms DESIGN.md: calm surfaces, data-first, one action color,
+   WCAG AA both themes. Tokens/classes here are the single source of truth.
+   Light: bg #f4f6fb · surface #ffffff · accent #1d4ed8
+   Dark:  bg #0b1120 · surface #111a2e · accent #60a5fa
+   Self-hosted fonts only (no CDN — on-prem requirement).
+   ============================================================ */
+:root {
+  --bg: #f4f6fb;
+  --surface: #ffffff;
+  --accent: #1d4ed8;
+  --accent-secondary: #0f766e;
+  --accent-ink: #ffffff;
+
+  /* Appearance presets — consumed by Settings via var(--preset-*). */
+  --preset-azure: #1d4ed8;
+  --preset-teal: #0f766e;
+  --preset-violet: #7c3aed;
+  --preset-crimson: #dc2626;
+  --preset-emerald: #059669;
+  --preset-amber: #d97706;
+  --error-ink: #ffffff;
+  --success: #059669;
+  --warning: #d97706;
+  --error: #dc2626;
+  --ink: #0f172a;
+  --muted: #475569;
+  --line: #e2e8f0;
+  --grid: color-mix(in oklab, var(--line) 40%, transparent);
+  --shadow-sm: 0 1px 0 0 var(--line), 0 1px 2px rgb(15 23 42 / 0.04);
+  --shadow-lg: 0 8px 24px -12px rgb(15 23 42 / 0.18);
+  color-scheme: light;
+}
+
+[data-theme='dark'] {
+  --bg: #0b1120;
+  --surface: #111a2e;
+  --accent: #60a5fa;
+  --accent-secondary: #2dd4bf;
+  --accent-ink: #0b1120;
+  --error-ink: #0b1120;
+  --success: #34d399;
+  --warning: #fbbf24;
+  --error: #f87171;
+  --ink: #e2e8f0;
+  --muted: #94a3b8;
+  --line: #1e293b;
+  --grid: color-mix(in oklab, var(--line) 40%, transparent);
+  --shadow-sm: 0 1px 0 0 var(--line), 0 1px 2px rgb(2 6 23 / 0.25);
+  --shadow-lg: 0 8px 24px -12px rgb(2 6 23 / 0.4);
+  color-scheme: dark;
+}
+
+/* Expose tokens as Tailwind utilities (bg-surface, text-muted, border-line, …).
+   `inline` keeps var() references live so data-theme switching works at runtime. */
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-accent: var(--accent);
+  --color-accent-ink: var(--accent-ink);
+  --color-error-ink: var(--error-ink);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-error: var(--error);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-line: var(--line);
+  --font-sans-fallback: 'Inter Variable', 'Inter', ui-sans-serif, system-ui, sans-serif;
+  --font-sans: var(--font-sans-fallback);
+  --font-display: 'Sora Variable', 'Sora', 'Inter Variable', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono Variable', 'JetBrains Mono', ui-monospace, monospace;
+}
+
+@layer base {
+  :root { --font-scale: 100%; --ui-scale: 100%; }
+  html { font-size: calc(16px * var(--ui-scale) / 100%); }
+  body {
+    margin: 0;
+    background-color: var(--bg);
+    background-image:
+      linear-gradient(var(--grid) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+    background-size: 32px 32px;
+    background-position: 0 0;
+    color: var(--ink);
+    font-family: var(--font-sans);
+    font-size: calc(1rem * var(--font-scale) / 100%);
+    -webkit-font-smoothing: antialiased;
+    letter-spacing: -0.01em;
+  }
+  h1, h2, h3, h4, h5, h6 { font-family: var(--font-display); letter-spacing: -0.01em; }
+  pre, code, kbd { font-family: var(--font-mono); }
+  ::selection { background: color-mix(in oklab, var(--accent) 25%, transparent); }
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, ::before, ::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
+
+@layer utilities {
+  .scrollbar-hide {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+  .scrollbar-hide::-webkit-scrollbar { display: none; }
+  /* visually hide the scrollbar but keep it functional */
+  .hide-scrollbar {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+  .hide-scrollbar::-webkit-scrollbar,
+  .hide-scrollbar::-webkit-scrollbar-thumb { display: none; }
+}
+
+/* ============ Component class system (no UI library) ============ */
+@layer components {
+  .mono-label {
+    font-family: var(--font-mono);
+    font-size: 0.6875rem;
+    font-weight: 500;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  /* btn — Inter 600, hairline, primary blue gradient, 150ms hover */
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    font-weight: 600;
+    font-size: 0.875rem;
+    line-height: 1;
+    border-radius: 10px;
+    border: 1px solid var(--line);
+    padding: 0.625rem 1rem;
+    cursor: pointer;
+    transition: filter 150ms ease, background-color 150ms ease,
+      border-color 150ms ease, transform 150ms ease;
+  }
+  .btn:active { transform: translateY(1px); }
+  .btn:disabled { opacity: 0.55; cursor: not-allowed; }
+  .btn-primary {
+    background-image: linear-gradient(180deg,
+      color-mix(in oklab, var(--accent) 88%, white), var(--accent));
+    border-color: color-mix(in oklab, var(--accent) 80%, black);
+    color: var(--accent-ink);
+  }
+  .btn-primary:hover { filter: brightness(1.08); }
+  .btn-ghost { background: transparent; border-color: transparent; color: var(--muted); }
+  .btn-ghost:hover { background: color-mix(in oklab, var(--ink) 6%, transparent); color: var(--ink); }
+  .btn-outline { background: transparent; border-color: var(--line); color: var(--ink); }
+  .btn-outline:hover { background: color-mix(in oklab, var(--ink) 4%, transparent); }
+  .btn-danger {
+    background-image: linear-gradient(180deg,
+      color-mix(in oklab, var(--error) 88%, white), var(--error));
+    border-color: color-mix(in oklab, var(--error) 80%, black);
+    color: var(--error-ink);
+  }
+  .btn-danger:hover { filter: brightness(1.08); }
+
+  /* input — surface fill, 8px radius, accent focus ring */
+  .input {
+    width: 100%;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 0.5rem 0.75rem;
+    font: inherit;
+    font-size: 0.875rem;
+    color: var(--ink);
+    transition: border-color 150ms ease, box-shadow 150ms ease;
+  }
+  .input::placeholder { color: color-mix(in oklab, var(--muted) 75%, transparent); }
+  .input:hover { border-color: color-mix(in oklab, var(--accent) 35%, var(--line)); }
+  .input:focus-visible {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px color-mix(in oklab, var(--accent) 30%, transparent);
+  }
+  .input[aria-invalid='true'] { border-color: var(--error); }
+  .input[aria-invalid='true']:focus-visible {
+    box-shadow: 0 0 0 2px color-mix(in oklab, var(--error) 30%, transparent);
+  }
+  .input-error { border-color: var(--error) !important; }
+
+  /* select — polished native select, same hover/focus/invalid as .input */
+  .select {
+    width: 100%;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 0.5rem 0.75rem;
+    font: inherit;
+    font-size: 0.875rem;
+    color: var(--ink);
+    appearance: none;
+    -webkit-appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2364748b' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 0.75rem center;
+    background-size: 0.75rem;
+    cursor: pointer;
+    transition: border-color 150ms ease, box-shadow 150ms ease;
+  }
+  .select:hover { border-color: color-mix(in oklab, var(--accent) 35%, var(--line)); }
+  .select:focus-visible {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px color-mix(in oklab, var(--accent) 30%, transparent);
+  }
+  .select[aria-invalid='true'] { border-color: var(--error); }
+  .select[aria-invalid='true']:focus-visible {
+    box-shadow: 0 0 0 2px color-mix(in oklab, var(--error) 30%, transparent);
+  }
+  .select option { background: var(--surface); color: var(--ink); }
+
+  /* card / stat — theme-aware surfaces with hairline inset */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    box-shadow: var(--shadow-sm), var(--shadow-lg);
+    position: relative;
+  }
+  .card::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--line) 60%, transparent);
+    pointer-events: none;
+  }
+  .stat { padding: 1rem; display: flex; flex-direction: column; gap: 0.375rem; }
+  .stat-value {
+    font-family: var(--font-mono);
+    font-size: 1.5rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+  }
+
+  /* badge — tinted mono uppercase pill; set --badge-color per variant */
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    width: fit-content;
+    font-family: var(--font-mono);
+    font-size: 0.6875rem;
+    font-weight: 500;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    border-radius: 999px;
+    padding: 0.25rem 0.625rem;
+    color: var(--badge-color, var(--muted));
+    border: 1px solid color-mix(in oklab, var(--badge-color, var(--muted)) 30%, transparent);
+    background: color-mix(in oklab, var(--badge-color, var(--muted)) 10%, transparent);
+  }
+  .badge-success { --badge-color: var(--success); }
+  .badge-warning { --badge-color: var(--warning); }
+  .badge-error   { --badge-color: var(--error); }
+  .badge-accent  { --badge-color: var(--accent); }
+  .badge-muted   { --badge-color: var(--muted); }
+
+  /* table — sticky mono uppercase thead, hover tint 5%, row select states */
+  .data-table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
+  .data-table thead th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: var(--surface);
+    text-align: left;
+    font-family: var(--font-mono);
+    font-size: 0.6875rem;
+    font-weight: 500;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    padding: 0.625rem 0.75rem;
+    border-bottom: 1px solid var(--line);
+    box-shadow: 0 1px 0 0 var(--line);
+  }
+  .data-table tbody td {
+    padding: 0.625rem 0.75rem;
+    border-bottom: 1px solid color-mix(in oklab, var(--line) 60%, transparent);
+  }
+  .data-table tbody tr:nth-child(even) { background: color-mix(in oklab, var(--ink) 2%, transparent); }
+  .data-table tbody tr { transition: background-color 150ms ease; }
+  .data-table tbody tr:hover { background: color-mix(in oklab, var(--accent) 5%, transparent); }
+  .data-table tbody tr[data-selectable='true'] { cursor: pointer; }
+  .data-table tbody tr[data-selected='true'] {
+    background: color-mix(in oklab, var(--accent) 10%, transparent);
+  }
+
+  /* sidebar link — 200ms ease, accent-tinted active */
+  .sidebar-link {
+    display: flex;
+    align-items: center;
+    gap: 0.625rem;
+    border-radius: 8px;
+    padding: 0.5rem 0.75rem;
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: var(--muted);
+    text-decoration: none;
+    transition: background-color 200ms ease, color 200ms ease;
+  }
+  .sidebar-link:hover {
+    background: color-mix(in oklab, var(--ink) 8%, transparent);
+    color: var(--ink);
+  }
+  .sidebar-link[aria-current='page'] {
+    background: color-mix(in oklab, var(--accent) 15%, transparent);
+    color: var(--accent);
+    font-weight: 600;
+  }
+
+  /* modal — persists until explicitly closed (DESIGN.md: no overlay close) */
+  .modal-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 1rem;
+    background: rgb(2 6 23 / 0.55);
+  }
+  .modal-box {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    width: 100%;
+    max-height: min(85vh, 48rem);
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 24px 64px -16px rgb(2 6 23 / 0.35);
+  }
+  .modal-sm { max-width: 26rem; }
+  .modal-md { max-width: 36rem; }
+  .modal-lg { max-width: 56rem; }
+  .modal-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 1rem 1.25rem;
+    border-bottom: 1px solid var(--line);
+  }
+  .modal-head h3 { font-family: var(--font-display); font-size: 1rem; font-weight: 600; color: var(--ink); }
+  .modal-close {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 2rem;
+    height: 2rem;
+    border-radius: 8px;
+    border: none;
+    background: none;
+    color: var(--muted);
+    cursor: pointer;
+    transition: background-color 150ms ease, color 150ms ease;
+  }
+  .modal-close:hover { background: color-mix(in oklab, var(--ink) 6%, transparent); color: var(--ink); }
+  .modal-body { padding: 1.25rem; overflow: auto; }
+  .modal-foot {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    padding: 1rem 1.25rem;
+    border-top: 1px solid var(--line);
+  }
+
+  /* toast — fixed top-right stack, 3px semantic left border (DESIGN.md) */
+  .toast-stack {
+    position: fixed;
+    right: 1rem;
+    top: 1rem;
+    z-index: 60;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+  .toast {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    min-width: 18rem;
+    max-width: 24rem;
+    background: var(--surface);
+    color: var(--ink);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--toast-color, var(--accent));
+    border-radius: 10px;
+    padding: 0.75rem 1rem;
+    font-size: 0.875rem;
+    box-shadow: 0 12px 32px -12px rgb(2 6 23 / 0.3);
+    animation: toast-in 200ms ease;
+  }
+  .toast-success { --toast-color: var(--success); }
+  .toast-error   { --toast-color: var(--error); }
+  .toast-info    { --toast-color: var(--accent); }
+  .toast-warning { --toast-color: var(--warning); }
+  .toast-x {
+    margin-left: auto;
+    background: none;
+    border: 0;
+    color: var(--muted);
+    cursor: pointer;
+    padding: 0.125rem;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 6px;
+    transition: color 150ms ease;
+  }
+  .toast-x:hover { color: var(--ink); }
+  @keyframes toast-in {
+    from { opacity: 0; transform: translateY(0.5rem); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  /* tabs — underline tab strip */
+  .tabbar {
+    display: flex;
+    gap: 0.25rem;
+    border-bottom: 1px solid var(--line);
+    margin-bottom: 1rem;
+    flex-wrap: wrap;
+  }
+  .tab {
+    background: none;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+    padding: 0.5rem 0.75rem;
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: var(--muted);
+    cursor: pointer;
+    transition: color 150ms ease, border-color 150ms ease;
+  }
+  .tab:hover { color: var(--ink); }
+  .tab-active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+
+  /* header dropdown (notifications/user menu) */
+  .dropdown { position: relative; }
+  .dropdown-panel {
+    position: absolute;
+    right: 0;
+    top: calc(100% + 0.5rem);
+    z-index: 200;
+    min-width: 20rem;
+    max-width: 40rem;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    box-shadow: 0 16px 48px -16px rgb(2 6 23 / 0.3);
+    overflow: hidden;
+  }
+  .dropdown-divider { height: 1px; background: var(--line); margin: 0.5rem 0; }
+  .dropdown-item {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    width: 100%;
+    padding: 0.625rem 1rem;
+    font-size: 0.875rem;
+    background: none;
+    border: none;
+    border-radius: 0;
+    cursor: pointer;
+    text-align: left;
+    color: var(--ink);
+    transition: background-color 150ms ease;
+  }
+  .dropdown-item:hover { background: color-mix(in oklab, var(--accent) 8%, transparent); }
+  .dropdown-item[aria-current='true'],
+  .dropdown-item.active {
+    background: color-mix(in oklab, var(--accent) 15%, transparent);
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .dropdown-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid var(--line);
+  }
+  .dropdown-footer {
+    padding: 0.75rem 1rem;
+    border-top: 1px solid var(--line);
+  }
+
+  /* skeleton — loading placeholder */
+  .skeleton {
+    background: linear-gradient(90deg, var(--line) 25%, color-mix(in oklab, var(--line) 80%, var(--muted)) 50%, var(--line) 75%);
+    background-size: 200% 100%;
+    animation: shimmer 1.5s infinite;
+    border-radius: 4px;
+  }
+  @keyframes shimmer {
+    0% { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+  }
+}
+
+/* Custom scrollbars — government subtle, token-aware */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in oklab, var(--muted) 40%, transparent) transparent;
+}
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb {
+  background: color-mix(in oklab, var(--muted) 35%, transparent);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in oklab, var(--muted) 55%, transparent);
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-corner { background: transparent; }
