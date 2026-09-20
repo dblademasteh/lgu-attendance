@@ -174,8 +174,14 @@ export const syncService = {
 
   /**
    * Pull the roster from the HRMS API (scheduled fallback or manual run).
-   * Pages through GET /api/v1/employees, upserts every entry, and records a
-   * SUCCESS/PARTIAL/FAILED SyncLog.
+   * Pages through GET {base}/integrations/employees, upserts every entry,
+   * and records a SUCCESS/PARTIAL/FAILED SyncLog.
+   *
+   * HRMS orders by lastName (non-unique), so OFFSET pages re-sorted per
+   * request can duplicate a boundary row and skip another. To guarantee full
+   * coverage, each run tracks ingested employeeNumbers and sweeps up to two
+   * extra passes with different page sizes (different windows land the
+   * skipped rows) until the roster total is covered or a pass adds nothing.
    */
   async runPoll({ triggeredBy = 'system' } = {}) {
     if (!(await isHrmsConfigured())) {
@@ -190,29 +196,42 @@ export const syncService = {
     }
     let processed = 0;
     let failed = 0;
-    let page = 1;
-    const limit = 100;
+    let expectedTotal = null;
+    const seen = new Set();
     const errors = [];
-    for (;;) {
-      let result;
-      try {
-        result = await fetchHrmsEmployees({ page, limit });
-      } catch (e) {
-        errors.push(`page ${page}: ${e.message}`);
-        failed += 1;
-        break;
-      }
-      for (const item of result.items) {
+    for (const limit of [100, 73, 37]) {
+      let addedThisPass = 0;
+      let page = 1;
+      for (;;) {
+        let result;
         try {
-          await employeeService.upsertFromHrms(item, 'POLL');
-          processed += 1;
+          result = await fetchHrmsEmployees({ page, limit });
         } catch (e) {
+          errors.push(`page ${page}: ${e.message}`);
           failed += 1;
-          errors.push(`${item.employeeNumber ?? item.employeeId ?? 'unknown'}: ${e.message}`);
+          break;
         }
+        if (expectedTotal === null) expectedTotal = result.total;
+        for (const item of result.items) {
+          const num = item.employeeNumber ?? item.employeeId ?? null;
+          if (num && seen.has(num)) continue;
+          try {
+            await employeeService.upsertFromHrms(item, 'POLL');
+            processed += 1;
+            if (num) {
+              seen.add(num);
+              addedThisPass += 1;
+            }
+          } catch (e) {
+            failed += 1;
+            errors.push(`${num ?? 'unknown'}: ${e.message}`);
+          }
+        }
+        if (result.items.length < limit || page * limit >= result.total) break;
+        page += 1;
       }
-      if (result.items.length === 0 || page * limit >= result.total) break;
-      page += 1;
+      if (expectedTotal !== null && seen.size >= expectedTotal) break;
+      if (addedThisPass === 0) break;
     }
     const status = failed === 0 ? 'SUCCESS' : (processed > 0 ? 'PARTIAL' : 'FAILED');
     await syncRepository.create({
