@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { syncRepository } from '../repositories/syncRepository.js';
 import { employeeService } from './employeeService.js';
 import { attendanceService } from './attendanceService.js';
@@ -70,6 +71,65 @@ function toHrmsBulkRecords(event, payload = {}) {
     }));
   }
   return [];
+}
+
+/** Deterministic JSON stringification (stable key order) for idempotency keys. */
+function stableStringify(obj) {
+  if (obj == null) return String(obj);
+  if (typeof obj !== 'object') return JSON.stringify(obj);
+  if (Array.isArray(obj)) return '[' + obj.map(stableStringify).join(',') + ']';
+  return '{' + Object.keys(obj).sort().map((k) => JSON.stringify(k) + ':' + stableStringify(obj[k])).join(',') + '}';
+}
+
+/**
+ * Deterministic idempotency key for an outbound HRMS forward: a hash of the
+ * HRMS-shaped request body + the event's Manila day. Two forwards sharing a
+ * key are the same logical delivery — a retry after a transient failure
+ * deduplicates instead of double-sending (HRMS is the source of truth for its
+ * own computed attendance).
+ */
+function deriveIdempotencyKey(event, hrmsBody) {
+  const day = manilaDateKey(new Date());
+  const raw = `${event}:${day}:${stableStringify(hrmsBody)}`;
+  return `fwd-${crypto.createHash('sha256').update(raw).digest('hex').slice(0, 32)}`;
+}
+
+const TRANSIENT_STATUSES = new Set([0, 408, 429, 500, 502, 503, 504]);
+/** A failed post is retryable only on transient transport/HTTP errors. */
+function isTransient(result) {
+  if (!result || result.ok) return false;
+  return TRANSIENT_STATUSES.has(result.status);
+}
+
+function backoffSleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const FORWARD_RETRIES = 3;
+const FORWARD_BACKOFF_MS = [500, 1000, 2000];
+
+/**
+ * Send a single HRMS-shaped body with retry-on-transient and per-call
+ * idempotency. Returns the last result; dedups against a prior SUCCESS SyncLog.
+ */
+async function sendOnceWithRetry(method, event, hrmsBody) {
+  const key = deriveIdempotencyKey(event, hrmsBody);
+  const already = await syncRepository.findSuccessfulByKey(key);
+  if (already) {
+    return { ok: true, status: 200, body: 'already forwarded', deduped: true, idempotencyKey: key, attempt: 0 };
+  }
+  let result;
+  let lastAttempt = 0;
+  for (let attempt = 0; attempt <= FORWARD_RETRIES; attempt += 1) {
+    lastAttempt = attempt;
+    result = await method(hrmsBody);
+    if (result.ok || !isTransient(result) || attempt === FORWARD_RETRIES) break;
+    await backoffSleep(FORWARD_BACKOFF_MS[attempt] ?? FORWARD_BACKOFF_MS[FORWARD_RETRIES]);
+  }
+  result.idempotencyKey = key;
+  result.attempt = result.ok ? lastAttempt + 1 : FORWARD_RETRIES + 1;
+  result.deduped = false;
+  return result;
 }
 
 export const syncService = {
@@ -354,8 +414,16 @@ export const syncService = {
    * Outbound delivery (choice B: this app collects punches, HRMS computes).
    * Routes each local event into HRMS's ingestion shapes (x-api-key,
    * scope attendance:ingest): single punches -> POST .../punch, corrections
-   * and backfills -> POST .../bulk. Always resolves + logs a SyncLog
-   * (OUTBOUND) — a forward failure never rolls back local writes.
+   * and backfills -> POST .../bulk.
+   *
+   * Idempotency: every outbound API call is keyed by a deterministic hash of the
+   * HRMS-shaped body + Manila day. A retry (or a duplicate fireForwardToHrms)
+   * whose key already has a SUCCESS SyncLog is skipped — HRMS never sees the
+   * same punch/correction twice. Transient failures (network, 5xx, 429, 408)
+   * are retried with exponential backoff; only a terminal, non-retryable error
+   * (or exhaustion of retries) writes a FAILED log, which intentionally omits
+   * the key so a later manual retry can still succeed.
+   *
    * HRMS-originated webhook punches are NEVER echoed back here (loop
    * prevention) — HRMS already holds them.
    */
@@ -363,36 +431,48 @@ export const syncService = {
     const cfg = await hrmsConfig();
     if (!cfg.attendanceForwarding) return { skipped: true };
     try {
-      let result;
-      let processed;
+      let calls;
       let label;
       if (event === 'correction' || event === 'mark_absent') {
+        // Bulk ingestion: one HRMS call carrying all records.
         const records = toHrmsBulkRecords(event, payload);
-        processed = records.length;
-        label = `${processed} record(s) (${event})`;
-        result = processed > 0 ? await postHrmsBulk(records) : { ok: true, status: 200, body: 'nothing to forward' };
+         calls = records.length > 0
+          ? [{ method: (b) => postHrmsBulk(b), hrmsBody: { records } }]
+          : [{ method: () => Promise.resolve({ ok: true, status: 200, body: 'nothing to forward' }), hrmsBody: { records: [] } }];
+        label = `${records.length} record(s) (${event})`;
       } else {
+        // Per-punch ingestion: each punch is its own HRMS call so a deduped
+        // or retried punch is isolated (no clobbering a sibling's success).
         const punches = toHrmsPunches(event, payload);
-        processed = punches.length;
-        label = `${processed} punch(es) (${event})`;
-        const results = [];
-        for (const punch of punches) results.push(await postHrmsPunch(punch));
-        const failed = results.filter((r) => !r.ok);
-        result = failed.length === 0
-          ? { ok: true, status: 200, body: results.map((r) => r.body) }
-          : { ok: false, status: failed[0].status, body: failed.map((r) => r.body) };
+        calls = punches.map((punch) => ({ method: (b) => postHrmsPunch(b), hrmsBody: punch }));
+        label = `${punches.length} punch(es) (${event})`;
       }
-      await syncRepository.create({
-        source: 'WEBHOOK',
-        direction: 'OUTBOUND',
-        event,
-        status: result.ok ? 'SUCCESS' : 'FAILED',
-        processed,
-        message: result.ok
-          ? `Forwarded ${label} to HRMS`
-          : `HRMS forward failed (${result.status}): ${String(typeof result.body === 'string' ? result.body : JSON.stringify(result.body)).slice(0, 200)}`,
-        payload: { ok: result.ok, status: result.status },
-      });
+
+      const outcomes = await Promise.all(calls.map((c) => sendOnceWithRetry(c.method, event, c.hrmsBody)));
+      const deduped = outcomes.filter((r) => r.deduped).length;
+      const failed = outcomes.filter((r) => !r.ok);
+      const result = failed.length === 0
+        ? { ok: true, status: 200, body: outcomes.map((r) => r.body), deduped }
+        : { ok: false, status: failed[0].status, body: failed.map((r) => r.body), deduped };
+
+      // One SyncLog per HRMS API call so the idempotency key resolves to a
+      // single SUCCESS row per logical forward (no PK/unique collisions).
+      for (const out of outcomes) {
+        const isSuccess = out.ok;
+        const isDeduped = out.deduped;
+        await syncRepository.create({
+          source: 'WEBHOOK',
+          direction: 'OUTBOUND',
+          event,
+          status: isSuccess ? 'SUCCESS' : 'FAILED',
+          processed: out.deduped ? 0 : 1,
+          message: isSuccess
+            ? (isDeduped ? `Forwarded ${label} to HRMS (deduped — already sent)` : `Forwarded ${label} to HRMS`)
+            : `HRMS forward failed (${out.status}) after ${out.attempt} attempt(s): ${String(typeof out.body === 'string' ? out.body : JSON.stringify(out.body)).slice(0, 200)}`,
+          payload: { ok: out.ok, status: out.status, deduped: out.deduped, attempt: out.attempt },
+          idempotencyKey: isSuccess ? out.idempotencyKey : null,
+        });
+      }
       return result;
     } catch (e) {
       await syncRepository.create({

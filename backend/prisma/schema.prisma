@@ -255,9 +255,15 @@ model SyncLog {
   message   String?
   payload   Json?
   createdAt DateTime      @default(now()) @db.Timestamptz(6)
+  /// Deterministic id derived from the HRMS-shaped outbound payload + Manila
+  /// day; lets forwardToHrms dedup retries so a transient HRMS outage or
+  /// client retry never double-sends a punch (single source of truth on HRMS).
+  /// NULL for INBOUND/PULL rows; unique constraint allows repeated NULLs.
+  idempotencyKey String? @unique @db.VarChar(128)
 
   @@index([createdAt])
   @@index([status])
+  @@index([direction, createdAt])
 }
 
 /// In-app HRMS connection config (Settings > Integration). A saved row takes
