@@ -412,7 +412,35 @@ export const attendanceService = {
   },
 
   /**
-   * Ingest raw biometric punches mirrored from HRMS device hardware (received via
+   * Reverse-sync export for HRMS's pull flow (POST /api/v1/attendance/punches).
+   * Returns attendance rows newer than `since` (default: 7 days) in HRMS's
+   * bulk-import shape ({employeeNumber, date, timeIn?, timeOut?, hours?,
+   * remark?, source?}) so HRMS's bulkIngest can upsert them. Dates are
+   * Manila-day keyed; times are ISO-8601 (HRMS normalizes both). Bounded to a
+   * 1000-row page to stay within HRMS's bulk array cap.
+   */
+  async pullForExternal({ since }) {
+    const where = since instanceof Date && !Number.isNaN(since.getTime())
+      ? { updatedAt: { gte: since } }
+      : {};
+    const records = await attendanceRepository.list({
+      skip: 0,
+      take: 1000,
+      where,
+      orderBy: [{ updatedAt: 'desc' }],
+    });
+    return records.map((r) => ({
+      employeeNumber: r.employee?.employeeNumber ?? null,
+      date: r.date ? manilaDateKey(new Date(r.date)) : null,
+      timeIn: r.timeIn ? r.timeIn.toISOString() : null,
+      timeOut: r.timeOut ? r.timeOut.toISOString() : null,
+      hours: r.hours ?? null,
+      remark: r.remarks ?? null,
+      source: r.source ?? ATTENDANCE_SOURCES.MANUAL,
+    }));
+  },
+
+  /**
    * the biometric.punch / biometric.punch_batch webhook events). Punches are
    * grouped per employee per Manila day; the earliest becomes timeIn, the latest
    * timeOut (a single punch yields an open IN, no OUT). deriveLated from the

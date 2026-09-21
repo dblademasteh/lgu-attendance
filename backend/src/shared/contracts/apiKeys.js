@@ -42,3 +42,17 @@ export const externalEmployeeAttendanceSchema = z.object({
     to: z.string().regex(DATE_RE, 'Use YYYY-MM-DD').optional(),
   }),
 });
+
+/**
+ * Reverse-sync pull: HRMS posts { since: ISO8601 } to POST /api/v1/attendance/punches
+ * (Bearer API key, attendance:read scope) and receives { records: [...] } in the
+ * HRMS bulk-import shape for incremental ingestion.
+ */
+export const pullPunchesSchema = z.object({
+  body: z.object({
+    since: z
+      .string()
+      .optional()
+      .refine((v) => v === undefined || !Number.isNaN(Date.parse(v)), { message: 'since must be a valid ISO-8601 datetime' }),
+  }),
+});

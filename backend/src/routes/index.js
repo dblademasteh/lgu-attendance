@@ -4,10 +4,12 @@ import { requireRole } from '../middleware/rbac.js';
 import { auditLog } from '../middleware/audit.js';
 import { webhookLimiter } from '../middleware/rateLimit.js';
 import { validate } from '../middleware/validate.js';
+import { requireApiKey } from '../middleware/apiKey.js';
 import { verifyHrmsSignature, isIntegrationIpAllowed, getHrmsConfig } from '../lib/hrms.js';
 import { syncService } from '../services/syncService.js';
 import { AppError } from '../lib/errors.js';
 import { webhookSchema } from '../shared/contracts/sync.js';
+import { pullPunchesSchema } from '../shared/contracts/apiKeys.js';
 import authRouter from './auth.js';
 import employeesRouter from './employees.js';
 import attendanceRouter from './attendance.js';
@@ -15,6 +17,7 @@ import reportsRouter from './reports.js';
 import syncRouter from './sync.js';
 import apiKeysRouter from './apiKeys.js';
 import externalRouter from './external.js';
+import * as externalController from '../controllers/externalController.js';
 import { deviceRouter, adminRouter as deviceAdminRouter, credentialsRouter } from './biometric.js';
 import { SYNC_WRITE_ROLES } from '../shared/constants.js';
 
@@ -57,6 +60,12 @@ router.use('/external', externalRouter);
 router.use('/biometric', deviceRouter);
 // Biometric credential enrollment (WebAuthn) — JWT required.
 router.use('/biometric', credentialsRouter);
+
+// Reverse-sync pull: HRMS polls collected punches via POST /api/v1/attendance/punches
+// ({ since: ISO8601 }) and Bearer API key (attendance:read scope). No JWT — this is
+// a machine-consumer read for HRMS's sync flow. Mounted before requireAuth so the
+// Bearer-key auth applies instead of the JWT guard.
+router.post('/attendance/punches', requireApiKey('attendance:read'), validate(pullPunchesSchema), externalController.pull);
 
 // Everything below requires a JWT session; mutating requests pass through
 // the global audit mount exactly once.
