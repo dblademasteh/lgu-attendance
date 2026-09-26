@@ -261,26 +261,43 @@ model SyncLog {
   /// NULL for INBOUND/PULL rows; unique constraint allows repeated NULLs.
   idempotencyKey String? @unique @db.VarChar(128)
 
+  /// Which integration this sync row belongs to (null = legacy rows and manual
+  /// runs before multi-integration support, plus INBOUND rows on the legacy
+  /// /webhooks/hrms path that predate slug routing).
+  integrationId String?
+  integration Integration? @relation(fields: [integrationId], references: [id], onDelete: SetNull)
+
   @@index([createdAt])
   @@index([status])
   @@index([direction, createdAt])
+  @@index([integrationId, createdAt])
 }
 
-/// In-app HRMS connection config (Settings > Integration). A saved row takes
-/// precedence over env; empty fields fall back to env. Secrets are AES-GCM
-/// encrypted at rest (see lib/secrets.js) and never returned by the API.
-model IntegrationConfig {
-  id                   String   @id @default("default")
-  hrmsBaseUrl          String?
-  hrmsApiKeyEnc        String?
-  hrmsWebhookSecretEnc String?
-  pollerEnabled        Boolean  @default(false)
-  intervalMin          Int      @default(15)
-  timeoutMs            Int      @default(15000)
-  ingestPath           String   @default("/integrations/attendance")
-  forwardingEnabled    Boolean  @default(false)
-  createdAt            DateTime @default(now()) @db.Timestamptz(6)
-  updatedAt            DateTime @updatedAt @db.Timestamptz(6)
+/// External integration (Settings > Integration). Each row runs the same
+/// workflow — roster pull, webhooks, forwarding, test — against its own base
+/// URL, key, and secret. The migrated LGU-HRMS row is primary: env remains
+/// its provisioning fallback and it backs the legacy /webhooks/hrms path.
+model Integration {
+  id                String   @id @default(uuid())
+  name              String
+  provider          String   @default("hrms")
+  baseUrl           String?
+  apiKeyEnc         String?
+  webhookSecretEnc  String?
+  webhookSlug       String?  @unique
+  pollerEnabled     Boolean  @default(false)
+  intervalMin       Int      @default(15)
+  timeoutMs         Int      @default(15000)
+  ingestBase        String   @default("/integrations/attendance")
+  forwardingEnabled Boolean  @default(false)
+  isPrimary         Boolean  @default(false)
+  isActive          Boolean  @default(true)
+  createdAt         DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt         DateTime @updatedAt @db.Timestamptz(6)
+
+  syncLogs SyncLog[]
+
+  @@index([isActive])
 }
 
 /// Append-only audit trail for mutating requests (global audit middleware).

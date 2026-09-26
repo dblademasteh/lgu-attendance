@@ -1,6 +1,7 @@
 ﻿import { useCallback, useEffect, useState } from 'react';
-import { Copy, KeyRound, Link2, Loader2, PlugZap, Plus, RefreshCw, Trash2, X } from 'lucide-react';
-import { status as syncStatus, logs as syncLogs, run as runSync, getConfig as getSyncConfig, updateConfig as updateSyncConfig, testConnection as testSyncConnection } from '../api/sync.js';
+import { Copy, KeyRound, Link2, Loader2, Pencil, PlugZap, Plus, RefreshCw, Trash2, X } from 'lucide-react';
+import { status as syncStatus, logs as syncLogs, run as runSync } from '../api/sync.js';
+import { list as listIntegrations, create as createIntegration, update as updateIntegration, remove as removeIntegration, test as testIntegration, run as runIntegration } from '../api/integrations.js';
 import { list as listKeys, create as createKey, remove as removeKey } from '../api/apiKeys.js';
 import Badge from '../components/Badge.jsx';
 import ConfirmDialog from '../components/ConfirmDialog.jsx';
@@ -30,20 +31,26 @@ export default function Integration() {
   const [addKeyOpen, setAddKeyOpen] = useState(false);
   const [keyForm, setKeyForm] = useState({ name: '', attendanceRead: true, reportsRead: false });
   const [busy, setBusy] = useState(false);
-  const [logFilters, setLogFilters] = useState({ status: '', source: '', direction: '' });
+  const [logFilters, setLogFilters] = useState({ status: '', source: '', direction: '', integrationId: '' });
 
-  // HRMS connect form (ADMIN only — secrets involved).
-  const [cfg, setCfg] = useState(null);
-  const [cfgForm, setCfgForm] = useState({
-    baseUrl: '', apiKey: '', webhookSecret: '', pollerEnabled: false,
-    intervalMin: '', timeoutMs: '', ingestPath: '', forwardingEnabled: false,
-  });
-  const [cfgSaving, setCfgSaving] = useState(false);
-  const [cfgTesting, setCfgTesting] = useState(false);
-  const [cfgError, setCfgError] = useState(null);
-  const [testResult, setTestResult] = useState(null);
+  // Integrations manager (list for ADMIN/HR_MANAGER; mutations ADMIN only).
+  const EMPTY_FORM = {
+    name: '', provider: 'hrms', baseUrl: '', apiKey: '', webhookSecret: '', webhookSlug: '',
+    pollerEnabled: false, intervalMin: '15', timeoutMs: '15000', ingestBase: '/integrations/attendance',
+    forwardingEnabled: false, isPrimary: false, isActive: true,
+  };
+  const [integrations, setIntegrations] = useState([]);
+  const [intModalOpen, setIntModalOpen] = useState(false);
+  const [editingId, setEditingId] = useState(null);
+  const [intForm, setIntForm] = useState(EMPTY_FORM);
+  const [intFormError, setIntFormError] = useState(null);
+  const [intBusy, setIntBusy] = useState(false);
+  const [rowBusy, setRowBusy] = useState(null);
+  const [deleteTarget, setDeleteTarget] = useState(null);
 
-  const webhookUrl = typeof window !== 'undefined' ? `${window.location.origin}/api/v1/webhooks/hrms` : '/api/v1/webhooks/hrms';
+  const receiverUrl = (slug) => (typeof window !== 'undefined' && slug
+    ? `${window.location.origin}/api/v1/webhooks/${slug}`
+    : '');
 
   const load = useCallback(async (filters = logFilters) => {
     setBusy(true);
@@ -52,28 +59,17 @@ export default function Integration() {
       if (filters.status) params.status = filters.status;
       if (filters.source) params.source = filters.source;
       if (filters.direction) params.direction = filters.direction;
-      const [stateResult, logsResult] = await Promise.all([
+      if (filters.integrationId) params.integrationId = filters.integrationId;
+      const [stateResult, logsResult, integrationsResult] = await Promise.all([
         syncStatus(),
         syncLogs(params),
+        listIntegrations().catch(() => []),
       ]);
       setState(stateResult);
       setLogsData(logsResult);
+      setIntegrations(Array.isArray(integrationsResult) ? integrationsResult : []);
       if (isAdmin) {
         setKeysData(await listKeys().catch(() => null));
-        const cfgResult = await getSyncConfig().catch(() => null);
-        setCfg(cfgResult);
-        if (cfgResult) {
-          setCfgForm({
-            baseUrl: cfgResult.baseUrl ?? '',
-            apiKey: '',
-            webhookSecret: '',
-            pollerEnabled: cfgResult.pollerEnabled,
-            intervalMin: String(cfgResult.intervalMin ?? 15),
-            timeoutMs: String(cfgResult.timeoutMs ?? 15000),
-            ingestPath: cfgResult.attendanceIngestPath ?? '/integrations/attendance',
-            forwardingEnabled: cfgResult.attendanceForwarding,
-          });
-        }
       }
     } catch (e) {
       toast(e?.response?.data?.error?.message ?? 'Failed to load integration state', 'error');
@@ -141,69 +137,130 @@ export default function Integration() {
   const counts = state?.counts ?? [];
   const totalEvents = counts.reduce((n, c) => n + (c.count ?? 0), 0);
   const countOf = (status) => counts.find((c) => c.status === status)?.count ?? 0;
+  const primary = integrations.find((r) => r.isPrimary) ?? integrations[0] ?? null;
+
+  const copyText = async (text, okMessage) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      toast(okMessage, 'success');
+    } catch {
+      toast('Copy failed — select the text manually', 'error');
+    }
+  };
 
   const copyKey = async () => {
     if (!keyModal?.key) return;
-    try {
-      await navigator.clipboard.writeText(keyModal.key);
-      toast('API key copied', 'success');
-    } catch {
-      toast('Copy failed — select the key manually', 'error');
-    }
+    await copyText(keyModal.key, 'API key copied');
   };
 
-  const copyWebhookUrl = async () => {
-    try {
-      await navigator.clipboard.writeText(webhookUrl);
-      toast('Webhook URL copied — paste it into HRMS', 'success');
-    } catch {
-      toast('Copy failed — select the URL manually', 'error');
-    }
+  const openCreateIntegration = () => {
+    setEditingId(null);
+    setIntForm(EMPTY_FORM);
+    setIntFormError(null);
+    setIntModalOpen(true);
   };
 
-  const submitTestConnection = async () => {
-    setCfgTesting(true);
-    setCfgError(null);
-    setTestResult(null);
+  const openEditIntegration = (row) => {
+    setEditingId(row.id);
+    setIntForm({
+      name: row.name ?? '',
+      provider: row.provider ?? 'hrms',
+      baseUrl: row.baseUrl ?? '',
+      apiKey: '',
+      webhookSecret: '',
+      webhookSlug: row.webhookSlug ?? '',
+      pollerEnabled: row.pollerEnabled,
+      intervalMin: String(row.intervalMin ?? 15),
+      timeoutMs: String(row.timeoutMs ?? 15000),
+      ingestBase: row.attendanceIngestPath ?? '/integrations/attendance',
+      forwardingEnabled: row.attendanceForwarding,
+      isPrimary: row.isPrimary,
+      isActive: row.isActive,
+    });
+    setIntFormError(null);
+    setIntModalOpen(true);
+  };
+
+  const submitIntegrationForm = async (e) => {
+    e.preventDefault();
+    setIntBusy(true);
+    setIntFormError(null);
     try {
-      // Blank secret fields probe the saved values; typed values probe first.
-      const result = await testSyncConnection({
-        ...(cfgForm.baseUrl ? { baseUrl: cfgForm.baseUrl } : {}),
-        ...(cfgForm.apiKey ? { apiKey: cfgForm.apiKey } : {}),
-      });
-      setTestResult(result);
-      toast(result.message, result.ok ? 'success' : 'error');
-    } catch (e) {
-      const message = e?.response?.data?.error?.message ?? 'Connection test failed';
-      setTestResult({ ok: false, message });
-      toast(message, 'error');
+      const payload = {
+        name: intForm.name.trim(),
+        provider: intForm.provider,
+        baseUrl: intForm.baseUrl.trim(),
+        ...(intForm.apiKey ? { apiKey: intForm.apiKey } : {}),
+        ...(intForm.webhookSecret ? { webhookSecret: intForm.webhookSecret } : {}),
+        webhookSlug: intForm.webhookSlug.trim() || undefined,
+        pollerEnabled: intForm.pollerEnabled,
+        intervalMin: intForm.intervalMin !== '' ? Number(intForm.intervalMin) : undefined,
+        timeoutMs: intForm.timeoutMs !== '' ? Number(intForm.timeoutMs) : undefined,
+        ingestBase: intForm.ingestBase.trim() || undefined,
+        forwardingEnabled: intForm.forwardingEnabled,
+        isPrimary: intForm.isPrimary,
+        isActive: intForm.isActive,
+      };
+      if (editingId) {
+        await updateIntegration(editingId, payload);
+        toast('Integration updated — applied immediately', 'success');
+      } else {
+        await createIntegration(payload);
+        toast('Integration created', 'success');
+      }
+      setIntModalOpen(false);
+      await load();
+    } catch (err) {
+      setIntFormError(err?.response?.data?.error?.message ?? 'Failed to save integration');
     } finally {
-      setCfgTesting(false);
+      setIntBusy(false);
     }
   };
 
-  const submitSaveConfig = async () => {
-    setCfgSaving(true);
-    setCfgError(null);
+  const submitTestIntegration = async (id, withForm = false) => {
+    setRowBusy(id);
     try {
-      const updated = await updateSyncConfig({
-        baseUrl: cfgForm.baseUrl,
-        ...(cfgForm.apiKey ? { apiKey: cfgForm.apiKey } : {}),
-        ...(cfgForm.webhookSecret ? { webhookSecret: cfgForm.webhookSecret } : {}),
-        pollerEnabled: cfgForm.pollerEnabled,
-        intervalMin: cfgForm.intervalMin !== '' ? Number(cfgForm.intervalMin) : undefined,
-        timeoutMs: cfgForm.timeoutMs !== '' ? Number(cfgForm.timeoutMs) : undefined,
-        ingestPath: cfgForm.ingestPath || undefined,
-        forwardingEnabled: cfgForm.forwardingEnabled,
-      });
-      setCfg(updated);
-      setCfgForm((f) => ({ ...f, apiKey: '', webhookSecret: '' }));
-      toast('HRMS connection saved — applied immediately', 'success');
+      const body = withForm && editingId === id
+        ? {
+          ...(intForm.baseUrl.trim() ? { baseUrl: intForm.baseUrl.trim() } : {}),
+          ...(intForm.apiKey ? { apiKey: intForm.apiKey } : {}),
+        }
+        : {};
+      const result = await testIntegration(id, body);
+      toast(result.message, result.ok ? 'success' : 'error');
       await load();
     } catch (e) {
-      setCfgError(e?.response?.data?.error?.message ?? 'Failed to save configuration');
+      toast(e?.response?.data?.error?.message ?? 'Connection test failed', 'error');
     } finally {
-      setCfgSaving(false);
+      setRowBusy(null);
+    }
+  };
+
+  const submitRunIntegration = async (id) => {
+    setRowBusy(id);
+    try {
+      const result = id ? await runIntegration(id) : await runSync();
+      toast(`Sync ${String(result.status).toLowerCase()} — ${result.processed} employees processed`, result.status === 'SUCCESS' ? 'success' : 'warning');
+      await load();
+    } catch (e) {
+      toast(e?.response?.data?.error?.message ?? 'Sync failed', 'error');
+    } finally {
+      setRowBusy(null);
+    }
+  };
+
+  const submitDeleteIntegration = async () => {
+    if (!deleteTarget) return;
+    setIntBusy(true);
+    try {
+      await removeIntegration(deleteTarget.id);
+      toast(`Integration "${deleteTarget.name}" deleted`, 'success');
+      setDeleteTarget(null);
+      await load();
+    } catch (e) {
+      toast(e?.response?.data?.error?.message ?? 'Delete failed', 'error');
+    } finally {
+      setIntBusy(false);
     }
   };
 
@@ -240,6 +297,19 @@ export default function Integration() {
     },
   ];
 
+  const intModalFooter = (
+    <>
+      <button type="button" className="btn" onClick={() => setIntModalOpen(false)} disabled={intBusy}>
+        <X size={15} aria-hidden="true" />
+        Cancel
+      </button>
+      <button type="submit" form="integration-form" className="btn btn-primary" disabled={intBusy}>
+        <Link2 size={15} aria-hidden="true" />
+        {editingId ? 'Save changes' : 'Add integration'}
+      </button>
+    </>
+  );
+
   const keyModalFooter = (
     <>
       <button type="button" className="btn" onClick={() => setAddKeyOpen(false)} disabled={busy}>
@@ -255,15 +325,15 @@ export default function Integration() {
 
   const setupSteps = [
     {
-      title: 'Create an HRMS read key',
+      title: 'Create a remote read key',
       body: (
-        <>In LGU-HRMS → Settings → Integrations → <strong>API Keys</strong>, create a key with scopes <span className="font-mono">employees:read</span> (roster pull) and <span className="font-mono">attendance:ingest</span> (punch forwarding), then paste it into the HRMS Connection card below.</>
+        <>On the external system → Settings → Integrations → <strong>API Keys</strong>, create a key with scopes <span className="font-mono">employees:read</span> (roster pull) and <span className="font-mono">attendance:ingest</span> (punch forwarding), then paste it into the integration&apos;s form below.</>
       ),
     },
     {
       title: 'Register the webhook',
       body: (
-        <>In LGU-HRMS → Settings → Integrations → <strong>Webhooks</strong>, point to the receiver URL in the HRMS Connection card for events <span className="font-mono">employee.created</span> · <span className="font-mono">employee.updated</span> · <span className="font-mono">employee.deleted</span> (the three HRMS emits today; biometric/leave events are accepted for future use). Copy the secret (shown once) into the card&apos;s webhook secret field. HRMS-approved leaves arrive as local leave rows and drive <span className="font-mono">ON_LEAVE</span> in the absent backfill once HRMS emits them.</>
+        <>On the external system → Settings → Integrations → <strong>Webhooks</strong>, point to the integration&apos;s receiver URL (shown on its row, Copy button included) for events <span className="font-mono">employee.created</span> · <span className="font-mono">employee.updated</span> · <span className="font-mono">employee.deleted</span>. Copy the secret (shown once) into the integration&apos;s webhook secret field. Each integration enforces its own secret.</>
       ),
     },
     {
@@ -284,8 +354,8 @@ export default function Integration() {
     <div className="flex flex-col gap-4">
       <div className="flex items-end justify-between gap-4">
         <div className="min-w-0">
-          <h1 className="font-display text-xl font-bold text-ink">HRMS Integration</h1>
-          <p className="text-sm text-muted mt-0.5">LGU-HRMS via API — webhooks, roster polling, and external reads</p>
+          <h1 className="font-display text-xl font-bold text-ink">Integrations</h1>
+          <p className="text-sm text-muted mt-0.5">External systems via API — webhooks, roster polling, and external reads</p>
         </div>
         {canSync ? (
           <button type="button" className="btn btn-primary shrink-0" onClick={() => setRunOpen(true)} disabled={busy}>
@@ -299,36 +369,36 @@ export default function Integration() {
         <div className="card p-5">
           <div className="flex items-center justify-between gap-3">
             <div>
-              <div className="mono-label">Integration Config</div>
-              <h2 className="font-display font-semibold text-ink mt-0.5">Connection</h2>
+              <div className="mono-label">Primary Integration</div>
+              <h2 className="font-display font-semibold text-ink mt-0.5">{primary?.name ?? 'Connection'}</h2>
             </div>
-            <Badge value={state?.configured ? 'ACTIVE' : 'INACTIVE'} label={state?.configured ? 'Configured' : 'Not configured'} />
+            <Badge value={primary?.configured ? 'ACTIVE' : 'INACTIVE'} label={primary?.configured ? 'Configured' : 'Not configured'} />
           </div>
           <div className="divide-y divide-line">
             <div className="flex items-center justify-between py-2">
-              <span className="text-sm text-muted">HRMS base URL</span>
-              <span className="font-mono text-sm text-ink">{state?.baseUrl ?? '—'}</span>
+              <span className="text-sm text-muted">Base URL</span>
+              <span className="font-mono text-sm text-ink">{primary?.baseUrl ?? '—'}</span>
             </div>
             <div className="flex items-center justify-between py-2">
               <span className="text-sm text-muted">API key</span>
-              <Badge value={state?.apiKeySet ? 'ACTIVE' : 'INACTIVE'} label={state?.apiKeySet ? 'Set' : 'Missing'} />
+              <Badge value={primary?.apiKeySet ? 'ACTIVE' : 'INACTIVE'} label={primary?.apiKeySet ? 'Set' : 'Missing'} />
             </div>
             <div className="flex items-center justify-between py-2">
               <span className="text-sm text-muted">Webhook secret</span>
-              <Badge value={state?.webhookSecretSet ? 'ACTIVE' : 'INACTIVE'} label={state?.webhookSecretSet ? 'Set' : 'Missing'} />
+              <Badge value={primary?.webhookSecretSet ? 'ACTIVE' : 'INACTIVE'} label={primary?.webhookSecretSet ? 'Set' : 'Missing'} />
             </div>
             <div className="flex items-center justify-between py-2">
               <span className="text-sm text-muted">Roster poller</span>
-              <Badge value={state?.pollerEnabled ? 'ACTIVE' : 'INACTIVE'} label={state?.pollerEnabled ? `Every ${state?.intervalMin} min` : 'Disabled'} />
+              <Badge value={primary?.pollerEnabled ? 'ACTIVE' : 'INACTIVE'} label={primary?.pollerEnabled ? `Every ${primary?.intervalMin} min` : 'Disabled'} />
             </div>
             <div className="flex items-center justify-between py-2">
               <span className="text-sm text-muted">Punch forwarding</span>
-              <Badge value={state?.attendanceForwarding ? 'ACTIVE' : 'INACTIVE'} label={state?.attendanceForwarding ? 'To HRMS' : 'Off'} />
+              <Badge value={primary?.attendanceForwarding ? 'ACTIVE' : 'INACTIVE'} label={primary?.attendanceForwarding ? 'On' : 'Off'} />
             </div>
-            {state?.attendanceForwarding ? (
+            {primary?.attendanceForwarding ? (
               <div className="flex items-center justify-between py-2">
                 <span className="text-sm text-muted">Ingest endpoint</span>
-                <span className="font-mono text-sm text-ink break-all">{state?.ingestUrl ?? '—'}</span>
+                <span className="font-mono text-sm text-ink break-all">{primary?.ingestUrl ?? '—'}</span>
               </div>
             ) : null}
           </div>
@@ -381,112 +451,237 @@ export default function Integration() {
         </div>
       </div>
 
-      {isAdmin ? (
-        <div className="card p-5">
+      <div className="card p-5">
+        <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-3">
             <div className="grid place-items-center h-9 w-9 rounded-lg bg-accent/10 text-accent shrink-0">
               <Link2 size={16} aria-hidden="true" />
             </div>
             <div className="min-w-0">
-              <h2 className="font-display font-semibold text-ink">HRMS Connection</h2>
+              <h2 className="font-display font-semibold text-ink">External Integrations</h2>
               <p className="text-xs text-muted mt-0.5">
-                {cfg?.managedByDb
-                  ? 'In-app configuration active — changes apply immediately, no restart.'
-                  : 'Environment defaults active — save once to take over from here.'}
+                Each connection runs the same workflow — roster pull, webhooks, forwarding — against its own system.
               </p>
             </div>
           </div>
+          {isAdmin ? (
+            <button type="button" className="btn btn-outline shrink-0" onClick={openCreateIntegration} disabled={busy}>
+              <Plus size={15} aria-hidden="true" />
+              Add Integration
+            </button>
+          ) : null}
+        </div>
 
-          <div className="flex flex-wrap items-center justify-between gap-2 py-3 mt-2 border-t border-line">
-            <span className="text-sm text-muted">Webhook receiver (paste into HRMS)</span>
-            <div className="flex items-center gap-2 min-w-0">
-              <span className="font-mono text-xs text-ink truncate max-w-64">{webhookUrl}</span>
-              <button type="button" className="btn btn-outline shrink-0 px-3 py-1.5 text-xs" onClick={copyWebhookUrl}>
-                <Copy size={13} aria-hidden="true" />
-                Copy
-              </button>
+        <div className="divide-y divide-line mt-2">
+          {integrations.length === 0 ? (
+            <p className="text-sm text-muted py-3">No integrations yet — add one to connect an external system.</p>
+          ) : (
+            integrations.map((row) => (
+              <div key={row.id} className="py-3 flex flex-col gap-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-sm font-semibold text-ink">{row.name}</span>
+                  <Badge value={row.provider === 'hrms' ? 'WEBHOOK' : 'POLL'} label={row.provider} />
+                  {row.isPrimary ? <Badge value="ACTIVE" label="Primary" /> : null}
+                  {!row.isActive ? <Badge value="INACTIVE" label="Disabled" /> : null}
+                  <Badge value={row.configured ? 'ACTIVE' : 'INACTIVE'} label={row.configured ? 'Connected' : 'Not configured'} />
+                  <span className="mono-label ml-auto">{row.baseUrl ?? 'no URL'}</span>
+                </div>
+                <div className="flex flex-wrap items-center gap-x-5 gap-y-1 text-xs text-muted">
+                  <span>Key: {row.apiKeySet ? <span className="font-mono">{row.apiKeyPreview}</span> : 'missing'}</span>
+                  <span>Poller: {row.pollerEnabled ? `every ${row.intervalMin}m` : 'off'}</span>
+                  <span>Forwarding: {row.attendanceForwarding ? 'on' : 'off'}</span>
+                  <span>Last sync: {row.latestSync ? formatDateTime(row.latestSync.createdAt) : '—'}</span>
+                </div>
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className="text-xs text-muted shrink-0">Receiver</span>
+                  <span className="font-mono text-xs text-ink truncate">{receiverUrl(row.webhookSlug)}</span>
+                  <button
+                    type="button"
+                    className="btn btn-ghost shrink-0 px-2 py-1 text-xs"
+                    onClick={() => copyText(receiverUrl(row.webhookSlug), 'Webhook URL copied')}
+                    aria-label={`Copy webhook URL for ${row.name}`}
+                  >
+                    <Copy size={13} aria-hidden="true" />
+                  </button>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    className="btn btn-ghost px-3 py-1.5 text-xs"
+                    onClick={() => submitTestIntegration(row.id)}
+                    disabled={rowBusy === row.id}
+                  >
+                    {rowBusy === row.id ? <Loader2 size={13} className="animate-spin" aria-hidden="true" /> : <PlugZap size={13} aria-hidden="true" />}
+                    Test
+                  </button>
+                  {canSync ? (
+                    <button
+                      type="button"
+                      className="btn btn-ghost px-3 py-1.5 text-xs"
+                      onClick={() => submitRunIntegration(row.id)}
+                      disabled={rowBusy === row.id}
+                    >
+                      <RefreshCw size={13} aria-hidden="true" />
+                      Sync now
+                    </button>
+                  ) : null}
+                  {isAdmin ? (
+                    <>
+                      <button
+                        type="button"
+                        className="btn btn-ghost px-3 py-1.5 text-xs"
+                        onClick={() => openEditIntegration(row)}
+                      >
+                        <Pencil size={13} aria-hidden="true" />
+                        Edit
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-ghost px-3 py-1.5 text-xs"
+                        onClick={() => setDeleteTarget(row)}
+                      >
+                        <Trash2 size={13} aria-hidden="true" />
+                        Delete
+                      </button>
+                    </>
+                  ) : null}
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+
+      <Modal open={intModalOpen} title={editingId ? 'Edit Integration' : 'Add Integration'} onClose={() => setIntModalOpen(false)} footer={intModalFooter}>
+        <form id="integration-form" onSubmit={submitIntegrationForm} className="flex flex-col gap-3">
+          {editingId ? (
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-line bg-bg/60 px-3 py-2">
+              <span className="text-xs text-muted">Receiver URL</span>
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="font-mono text-xs text-ink truncate">{receiverUrl(intForm.webhookSlug || integrations.find((r) => r.id === editingId)?.webhookSlug)}</span>
+                <button
+                  type="button"
+                  className="btn btn-ghost shrink-0 px-2 py-1 text-xs"
+                  onClick={() => copyText(receiverUrl(intForm.webhookSlug || integrations.find((r) => r.id === editingId)?.webhookSlug), 'Webhook URL copied')}
+                  aria-label="Copy webhook receiver URL"
+                >
+                  <Copy size={13} aria-hidden="true" />
+                </button>
+              </div>
             </div>
-          </div>
-
-          <div className="grid gap-3 sm:grid-cols-2 mt-1">
-            <div className="flex flex-col gap-1">
-              <label className="mono-label" htmlFor="cfg-base-url">HRMS base URL</label>
+          ) : null}
+          <div className="grid gap-3 sm:grid-cols-2">
+            <div className="flex flex-col gap-1 sm:col-span-2">
+              <label className="mono-label" htmlFor="int-name">Name</label>
               <input
-                id="cfg-base-url"
+                id="int-name"
+                className="input"
+                placeholder="e.g. LGU-HRMS"
+                value={intForm.name}
+                onChange={(e) => setIntForm((f) => ({ ...f, name: e.target.value }))}
+                required
+              />
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="mono-label" htmlFor="int-provider">Provider</label>
+              <select
+                id="int-provider"
+                className="select"
+                value={intForm.provider}
+                onChange={(e) => setIntForm((f) => ({ ...f, provider: e.target.value }))}
+              >
+                <option value="hrms">hrms</option>
+                <option value="generic">generic</option>
+              </select>
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="mono-label" htmlFor="int-slug">Webhook slug (optional)</label>
+              <input
+                id="int-slug"
+                className="input font-mono"
+                placeholder="auto from name"
+                value={intForm.webhookSlug}
+                onChange={(e) => setIntForm((f) => ({ ...f, webhookSlug: e.target.value }))}
+              />
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="mono-label" htmlFor="int-base-url">Base URL</label>
+              <input
+                id="int-base-url"
                 className="input font-mono"
                 placeholder="http://localhost:4000/api/v1"
-                value={cfgForm.baseUrl}
-                onChange={(e) => setCfgForm((f) => ({ ...f, baseUrl: e.target.value }))}
+                value={intForm.baseUrl}
+                onChange={(e) => setIntForm((f) => ({ ...f, baseUrl: e.target.value }))}
               />
             </div>
             <div className="flex flex-col gap-1">
-              <label className="mono-label" htmlFor="cfg-ingest">Ingest base path</label>
+              <label className="mono-label" htmlFor="int-ingest">Ingest base path</label>
               <input
-                id="cfg-ingest"
+                id="int-ingest"
                 className="input font-mono"
                 placeholder="/integrations/attendance"
-                value={cfgForm.ingestPath}
-                onChange={(e) => setCfgForm((f) => ({ ...f, ingestPath: e.target.value }))}
+                value={intForm.ingestBase}
+                onChange={(e) => setIntForm((f) => ({ ...f, ingestBase: e.target.value }))}
               />
             </div>
             <div className="flex flex-col gap-1">
-              <label className="mono-label" htmlFor="cfg-api-key">API key (employees:read)</label>
+              <label className="mono-label" htmlFor="int-api-key">API key</label>
               <input
-                id="cfg-api-key"
+                id="int-api-key"
                 type="password"
                 className="input font-mono"
-                placeholder={cfg?.apiKeyPreview ? `Saved ${cfg.apiKeyPreview} — blank keeps it` : 'Not set'}
-                value={cfgForm.apiKey}
-                onChange={(e) => setCfgForm((f) => ({ ...f, apiKey: e.target.value }))}
+                placeholder={editingId ? 'Saved — blank keeps it' : 'Not set'}
+                value={intForm.apiKey}
+                onChange={(e) => setIntForm((f) => ({ ...f, apiKey: e.target.value }))}
                 autoComplete="off"
               />
             </div>
             <div className="flex flex-col gap-1">
-              <label className="mono-label" htmlFor="cfg-secret">Webhook secret</label>
+              <label className="mono-label" htmlFor="int-secret">Webhook secret</label>
               <input
-                id="cfg-secret"
+                id="int-secret"
                 type="password"
                 className="input font-mono"
-                placeholder={cfg?.webhookSecretSet ? 'Saved — blank keeps it' : 'Not set'}
-                value={cfgForm.webhookSecret}
-                onChange={(e) => setCfgForm((f) => ({ ...f, webhookSecret: e.target.value }))}
+                placeholder={editingId ? 'Saved — blank keeps it' : 'Not set'}
+                value={intForm.webhookSecret}
+                onChange={(e) => setIntForm((f) => ({ ...f, webhookSecret: e.target.value }))}
                 autoComplete="off"
               />
             </div>
             <div className="flex flex-col gap-1">
-              <label className="mono-label" htmlFor="cfg-interval">Poll every (minutes)</label>
+              <label className="mono-label" htmlFor="int-interval">Poll every (minutes)</label>
               <input
-                id="cfg-interval"
+                id="int-interval"
                 type="number"
                 min="1"
                 max="1440"
                 className="input"
-                value={cfgForm.intervalMin}
-                disabled={!cfgForm.pollerEnabled}
-                onChange={(e) => setCfgForm((f) => ({ ...f, intervalMin: e.target.value }))}
+                value={intForm.intervalMin}
+                disabled={!intForm.pollerEnabled}
+                onChange={(e) => setIntForm((f) => ({ ...f, intervalMin: e.target.value }))}
               />
             </div>
             <div className="flex flex-col gap-1">
-              <label className="mono-label" htmlFor="cfg-timeout">Timeout (ms)</label>
+              <label className="mono-label" htmlFor="int-timeout">Timeout (ms)</label>
               <input
-                id="cfg-timeout"
+                id="int-timeout"
                 type="number"
                 min="1000"
                 max="120000"
                 step="1000"
                 className="input"
-                value={cfgForm.timeoutMs}
-                onChange={(e) => setCfgForm((f) => ({ ...f, timeoutMs: e.target.value }))}
+                value={intForm.timeoutMs}
+                onChange={(e) => setIntForm((f) => ({ ...f, timeoutMs: e.target.value }))}
               />
             </div>
           </div>
 
-          <div className="flex flex-wrap items-center gap-x-6 gap-y-2 mt-3">
+          <div className="flex flex-wrap items-center gap-x-6 gap-y-2">
             <label className="flex items-center gap-2 text-sm text-ink cursor-pointer">
               <input
                 type="checkbox"
-                checked={cfgForm.pollerEnabled}
-                onChange={(e) => setCfgForm((f) => ({ ...f, pollerEnabled: e.target.checked }))}
+                checked={intForm.pollerEnabled}
+                onChange={(e) => setIntForm((f) => ({ ...f, pollerEnabled: e.target.checked }))}
                 className="w-4 h-4 accent-[color:var(--accent)]"
               />
               Roster poller
@@ -494,45 +689,63 @@ export default function Integration() {
             <label className="flex items-center gap-2 text-sm text-ink cursor-pointer">
               <input
                 type="checkbox"
-                checked={cfgForm.forwardingEnabled}
-                onChange={(e) => setCfgForm((f) => ({ ...f, forwardingEnabled: e.target.checked }))}
+                checked={intForm.forwardingEnabled}
+                onChange={(e) => setIntForm((f) => ({ ...f, forwardingEnabled: e.target.checked }))}
                 className="w-4 h-4 accent-[color:var(--accent)]"
               />
-              Forward punches to HRMS
+              Forward punches
+            </label>
+            <label className="flex items-center gap-2 text-sm text-ink cursor-pointer">
+              <input
+                type="checkbox"
+                checked={intForm.isPrimary}
+                onChange={(e) => setIntForm((f) => ({ ...f, isPrimary: e.target.checked }))}
+                className="w-4 h-4 accent-[color:var(--accent)]"
+              />
+              Primary
+            </label>
+            <label className="flex items-center gap-2 text-sm text-ink cursor-pointer">
+              <input
+                type="checkbox"
+                checked={intForm.isActive}
+                onChange={(e) => setIntForm((f) => ({ ...f, isActive: e.target.checked }))}
+                className="w-4 h-4 accent-[color:var(--accent)]"
+              />
+              Enabled
             </label>
           </div>
 
-          {testResult && (
-            <p
-              role="status"
-              className={`rounded-lg border px-3 py-2 text-xs leading-relaxed mt-3 ${
-                testResult.ok
-                  ? 'border-success/40 bg-success/10 text-success'
-                  : 'border-error/40 bg-error/10 text-error'
-              }`}
+          {editingId ? (
+            <button
+              type="button"
+              className="btn btn-outline self-start"
+              onClick={() => submitTestIntegration(editingId, true)}
+              disabled={intBusy || rowBusy === editingId}
             >
-              {testResult.message}
-            </p>
-          )}
-          {cfgError && <p className="text-sm text-error mt-3">{cfgError}</p>}
+              {rowBusy === editingId ? <Loader2 size={15} className="animate-spin" aria-hidden="true" /> : <PlugZap size={15} aria-hidden="true" />}
+              Test with these values
+            </button>
+          ) : null}
 
-          <div className="flex flex-wrap items-center gap-2 mt-4">
-            <button type="button" className="btn btn-primary" onClick={submitSaveConfig} disabled={cfgSaving || cfgTesting}>
-              {cfgSaving ? <Loader2 size={15} className="animate-spin" aria-hidden="true" /> : <Link2 size={15} aria-hidden="true" />}
-              Save connection
-            </button>
-            <button type="button" className="btn btn-outline" onClick={submitTestConnection} disabled={cfgSaving || cfgTesting}>
-              {cfgTesting ? <Loader2 size={15} className="animate-spin" aria-hidden="true" /> : <PlugZap size={15} aria-hidden="true" />}
-              Test connection
-            </button>
-          </div>
-          <p className="text-xs text-muted leading-relaxed mt-3">
-            Test probes the roster pull with what you typed (blank secrets probe the saved values) —
-            nothing is stored. Save encrypts secrets at rest, writes the audit trail, and restarts
-            the poller if needed. Clearing the base URL falls back to environment defaults.
+          {intFormError && <p className="text-sm text-error">{intFormError}</p>}
+          <p className="text-xs text-muted leading-relaxed">
+            Test probes with what you typed (blank secrets probe the saved values) — nothing is
+            stored. Save encrypts secrets at rest, writes the audit trail, and reconciles the
+            poller immediately.
           </p>
-        </div>
-      ) : null}
+        </form>
+      </Modal>
+
+      <ConfirmDialog
+        open={Boolean(deleteTarget)}
+        title="Delete Integration"
+        message={`Delete "${deleteTarget?.name}"? Roster rows already synced stay untouched; future polls, webhooks, and forwards for it stop.`}
+        confirmLabel="Delete"
+        danger
+        busy={intBusy}
+        onConfirm={submitDeleteIntegration}
+        onClose={() => setDeleteTarget(null)}
+      />
 
       <div className="card p-5">
         <div className="flex items-center gap-3">
@@ -566,8 +779,8 @@ export default function Integration() {
             <span className="font-mono text-sm text-ink">BiometricPunch table</span>
           </div>
           <div className="flex flex-wrap items-center justify-between gap-2 py-2">
-            <span className="text-sm text-muted">Outbound (app → HRMS)</span>
-            <span className="font-mono text-sm text-ink break-all">{state?.attendanceForwarding ? `${state?.ingestUrl || '/api/v1/attendance'} (on)` : 'off'}</span>
+            <span className="text-sm text-muted">Outbound (app → systems)</span>
+            <span className="font-mono text-sm text-ink break-all">{primary?.attendanceForwarding ? `${primary?.ingestUrl || '/integrations/attendance'} (on)` : 'off'}</span>
           </div>
         </div>
       </div>
@@ -596,7 +809,7 @@ export default function Integration() {
             <div className="mono-label">Sync Log</div>
             <span className="mono-label text-muted">{logsData?.total ?? 0} EVENTS</span>
           </div>
-          <Badge value={state?.configured ? 'ACTIVE' : 'INACTIVE'} label={state?.configured ? 'Live' : 'Unconfigured'} />
+          <Badge value={integrations.some((r) => r.configured) ? 'ACTIVE' : 'INACTIVE'} label={integrations.some((r) => r.configured) ? 'Live' : 'Unconfigured'} />
         </div>
         <div className="flex flex-wrap items-center gap-2 mb-2">
           <select
@@ -630,6 +843,17 @@ export default function Integration() {
             <option value="INBOUND">INBOUND</option>
             <option value="PULL">PULL</option>
             <option value="OUTBOUND">OUTBOUND</option>
+          </select>
+          <select
+            className="select w-auto text-xs"
+            aria-label="Filter sync log by integration"
+            value={logFilters.integrationId}
+            onChange={(e) => applyLogFilter('integrationId', e.target.value)}
+          >
+            <option value="">All integrations</option>
+            {integrations.map((row) => (
+              <option key={row.id} value={row.id}>{row.name}</option>
+            ))}
           </select>
         </div>
         <MasterTable columns={logColumns} rows={logsData?.items ?? []} empty="No sync events recorded yet." />

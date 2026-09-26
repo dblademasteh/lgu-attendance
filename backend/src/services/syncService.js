@@ -2,7 +2,12 @@ import crypto from 'node:crypto';
 import { syncRepository } from '../repositories/syncRepository.js';
 import { employeeService } from './employeeService.js';
 import { attendanceService } from './attendanceService.js';
-import { fetchHrmsEmployees, hrmsConfig, isHrmsConfigured, postHrmsPunch, postHrmsBulk, testHrmsEndpoint, refreshHrmsConfig } from '../lib/hrms.js';
+import { fetchHrmsEmployees, postHrmsPunch, postHrmsBulk, testHrmsEndpoint } from '../lib/hrms.js';
+import {
+  listIntegrations as fetchIntegrations, getIntegration, getPrimaryIntegration, integrationCreds,
+  resolveIntegrationConfig, integrationView, isIntegrationConfigured,
+  normalizeProvider, uniqueSlug, keepSecret,
+} from '../lib/integrations.js';
 import { manilaDateKey } from '../lib/time.js';
 import { encryptSecret } from '../lib/secrets.js';
 import { prisma } from '../lib/prisma.js';
@@ -10,6 +15,8 @@ import { AppError } from '../lib/errors.js';
 import { SYNC_EVENTS } from '../shared/constants.js';
 
 let pollerTimer = null;
+/** Last successful-or-attempted poll start per integration (ms epoch). */
+const lastPollAt = {};
 
 /** Human-readable one-liner for a failed HRMS ingest call. */
 function describeHrmsFailure(result) {
@@ -82,16 +89,16 @@ function stableStringify(obj) {
 }
 
 /**
- * Deterministic idempotency key for an outbound HRMS forward: a hash of the
- * HRMS-shaped request body + the event's Manila day. Two forwards sharing a
- * key are the same logical delivery — a retry after a transient failure
- * deduplicates instead of double-sending (HRMS is the source of truth for its
- * own computed attendance).
+ * Deterministic idempotency key for an outbound forward: a hash of the
+ * integration id + HRMS-shaped request body + the event's Manila day. Two
+ * forwards sharing a key are the same logical delivery — a retry after a
+ * transient failure deduplicates instead of double-sending (the remote system
+ * is the source of truth for its own computed attendance).
  */
-function deriveIdempotencyKey(event, hrmsBody) {
+function deriveIdempotencyKey(integrationId, event, hrmsBody) {
   const day = manilaDateKey(new Date());
-  const raw = `${event}:${day}:${stableStringify(hrmsBody)}`;
-  return `fwd-${crypto.createHash('sha256').update(raw).digest('hex').slice(0, 32)}`;
+  const raw = `${integrationId}:${event}:${day}:${stableStringify(hrmsBody)}`;
+  return `ifwd-${crypto.createHash('sha256').update(raw).digest('hex').slice(0, 32)}`;
 }
 
 const TRANSIENT_STATUSES = new Set([0, 408, 429, 500, 502, 503, 504]);
@@ -110,19 +117,21 @@ const FORWARD_BACKOFF_MS = [500, 1000, 2000];
 
 /**
  * Send a single HRMS-shaped body with retry-on-transient and per-call
- * idempotency. Returns the last result; dedups against a prior SUCCESS SyncLog.
+ * idempotency (scoped to the integration). Returns the last result; dedups
+ * against a prior SUCCESS SyncLog. `method` receives (creds, body).
  */
-async function sendOnceWithRetry(method, event, hrmsBody) {
-  const key = deriveIdempotencyKey(event, hrmsBody);
+async function sendOnceWithRetry(integration, method, event, hrmsBody) {
+  const key = deriveIdempotencyKey(integration.id, event, hrmsBody);
   const already = await syncRepository.findSuccessfulByKey(key);
   if (already) {
     return { ok: true, status: 200, body: 'already forwarded', deduped: true, idempotencyKey: key, attempt: 0 };
   }
+  const creds = integrationCreds(integration);
   let result;
   let lastAttempt = 0;
   for (let attempt = 0; attempt <= FORWARD_RETRIES; attempt += 1) {
     lastAttempt = attempt;
-    result = await method(hrmsBody);
+    result = await method(creds, hrmsBody);
     if (result.ok || !isTransient(result) || attempt === FORWARD_RETRIES) break;
     await backoffSleep(FORWARD_BACKOFF_MS[attempt] ?? FORWARD_BACKOFF_MS[FORWARD_RETRIES]);
   }
@@ -134,10 +143,12 @@ async function sendOnceWithRetry(method, event, hrmsBody) {
 
 export const syncService = {
   /**
-   * Process a verified webhook payload. employee.created/updated upsert the
-   * roster entry; employee.deleted soft-deletes it. Returns rows processed.
+   * Process a verified webhook payload for one integration.
+   * employee.created/updated upsert the roster entry; employee.deleted
+   * soft-deletes it. Returns rows processed.
    */
-  async processWebhook(payload) {
+  async processWebhook(payload, integration) {
+    const integrationId = integration?.id ?? null;
     switch (payload.event) {
       case SYNC_EVENTS.EMPLOYEE_CREATED:
       case SYNC_EVENTS.EMPLOYEE_UPDATED: {
@@ -191,6 +202,7 @@ export const syncService = {
         await syncRepository.create({
           source: 'WEBHOOK',
           direction: 'INBOUND',
+          integrationId,
           event: payload.event,
           status: processed > 0 && errors.length === 0 ? 'SUCCESS' : (processed > 0 ? 'PARTIAL' : 'FAILED'),
           processed,
@@ -218,6 +230,7 @@ export const syncService = {
         await syncRepository.create({
           source: 'WEBHOOK',
           direction: 'INBOUND',
+          integrationId,
           event: payload.event,
           status: result.processed > 0 ? 'SUCCESS' : 'FAILED',
           processed: result.processed,
@@ -233,9 +246,9 @@ export const syncService = {
   },
 
   /**
-   * Pull the roster from the HRMS API (scheduled fallback or manual run).
-   * Pages through GET {base}/integrations/employees, upserts every entry,
-   * and records a SUCCESS/PARTIAL/FAILED SyncLog.
+   * Pull one integration's roster (scheduled fallback or manual run). Pages
+   * through GET {base}/integrations/employees, upserts every entry, and
+   * records a SUCCESS/PARTIAL/FAILED SyncLog tagged with the integration.
    *
    * HRMS orders by lastName (non-unique), so OFFSET pages re-sorted per
    * request can duplicate a boundary row and skip another. To guarantee full
@@ -243,16 +256,25 @@ export const syncService = {
    * extra passes with different page sizes (different windows land the
    * skipped rows) until the roster total is covered or a pass adds nothing.
    */
-  async runPoll({ triggeredBy = 'system' } = {}) {
-    if (!(await isHrmsConfigured())) {
+  async runPoll({ integrationId = null, triggeredBy = 'system' } = {}) {
+    const integration = integrationId
+      ? await getIntegration(integrationId)
+      : await getPrimaryIntegration();
+    if (!integration || !integration.isActive) {
+      throw new AppError('Integration not found or inactive', 404, 'NOT_FOUND');
+    }
+    const cfg = resolveIntegrationConfig(integration);
+    const creds = integrationCreds(integration);
+    if (!(await isIntegrationConfigured(integration))) {
       await syncRepository.create({
         source: 'POLL',
         direction: 'PULL',
+        integrationId: integration.id,
         status: 'FAILED',
         processed: 0,
-        message: 'HRMS integration is not configured (HRMS_BASE_URL/HRMS_API_KEY)',
+        message: `Integration "${integration.name}" is not configured (base URL / API key)`,
       });
-      throw new AppError('HRMS integration is not configured (HRMS_BASE_URL/HRMS_API_KEY)', 400, 'HRMS_NOT_CONFIGURED');
+      throw new AppError(`Integration "${integration.name}" is not configured (base URL / API key)`, 400, 'HRMS_NOT_CONFIGURED');
     }
     let processed = 0;
     let failed = 0;
@@ -265,7 +287,7 @@ export const syncService = {
       for (;;) {
         let result;
         try {
-          result = await fetchHrmsEmployees({ page, limit });
+          result = await fetchHrmsEmployees(creds, { page, limit });
         } catch (e) {
           errors.push(`page ${page}: ${e.message}`);
           failed += 1;
@@ -297,13 +319,14 @@ export const syncService = {
     await syncRepository.create({
       source: 'POLL',
       direction: 'PULL',
+      integrationId: integration.id,
       status,
       processed,
       message: failed > 0
         ? errors.slice(0, 5).join(' | ')
-        : `Pulled ${processed} employees from HRMS (triggered by ${triggeredBy})`,
+        : `Pulled ${processed} employees from ${integration.name} (triggered by ${triggeredBy})`,
     });
-    return { status, processed, failed };
+    return { status, processed, failed, integrationId: integration.id };
   },
 
   async listLogs(filters = {}) {
@@ -313,6 +336,7 @@ export const syncService = {
     if (filters.status) where.status = filters.status;
     if (filters.source) where.source = filters.source;
     if (filters.direction) where.direction = filters.direction;
+    if (filters.integrationId) where.integrationId = filters.integrationId;
     const [items, total] = await Promise.all([
       syncRepository.list({ skip: (page - 1) * limit, take: limit, where }),
       syncRepository.count(where),
@@ -320,84 +344,179 @@ export const syncService = {
     return { items, total, page, limit };
   },
 
-  /** Non-secret view of the integration state for GET /sync/status. */
+  /** Aggregate integration state for GET /sync/status. */
   async status() {
-    const config = await hrmsConfig();
+    const integrations = await fetchIntegrations();
     const [latest, counts] = await Promise.all([syncRepository.latest(), syncRepository.counts()]);
-    return { configured: await isHrmsConfigured(), ...config, latestSync: latest, counts };
+    const rows = await Promise.all(integrations.map(async (integration) => {
+      const view = integrationView(integration);
+      const latestSync = await syncRepository.latestFor(integration.id);
+      return { ...view, configured: await isIntegrationConfigured(integration), latestSync };
+    }));
+    return { integrations: rows, latestSync: latest, counts };
   },
 
-  /** Saved in-app connection config (non-secret view) for GET /sync/config. */
-  async getConfig() {
-    return hrmsConfig();
+  /** Enriched integration rows (masked views + status) for the manager UI. */
+  async listIntegrations() {
+    const integrations = await fetchIntegrations();
+    return Promise.all(integrations.map(async (integration) => {
+      const view = integrationView(integration);
+      const latestSync = await syncRepository.latestFor(integration.id);
+      return { ...view, configured: await isIntegrationConfigured(integration), latestSync };
+    }));
   },
 
-  /**
-   * Persist the in-app connection config (ADMIN). Empty-string/undefined
-   * secrets are kept, explicit null clears back to env. Applies immediately:
-   * config cache refresh + poller restart, no backend restart needed.
-   */
-  async updateConfig(patch) {
-    const existing = await prisma.integrationConfig.findUnique({ where: { id: 'default' } }).catch(() => null);
-    const keepSecret = (v, current) => (v === undefined || v === '' ? current ?? null : (v === null ? null : encryptSecret(v)));
+  /** Single masked integration view (throws NOT_FOUND when missing). */
+  async getIntegrationView(id) {
+    const integration = await getIntegration(id);
+    if (!integration) throw new AppError('Integration not found', 404, 'NOT_FOUND');
+    return integrationView(integration);
+  },
+
+  /** Create an integration (ADMIN). Slug auto-derives from the name. */
+  async createIntegration(patch) {
     const data = {
-      hrmsBaseUrl: patch.baseUrl === undefined ? (existing?.hrmsBaseUrl ?? null) : (patch.baseUrl || null),
-      hrmsApiKeyEnc: keepSecret(patch.apiKey, existing?.hrmsApiKeyEnc),
-      hrmsWebhookSecretEnc: keepSecret(patch.webhookSecret, existing?.hrmsWebhookSecretEnc),
-      pollerEnabled: patch.pollerEnabled ?? existing?.pollerEnabled ?? false,
-      intervalMin: patch.intervalMin ?? existing?.intervalMin ?? 15,
-      timeoutMs: patch.timeoutMs ?? existing?.timeoutMs ?? 15000,
-      ingestPath: patch.ingestPath ?? existing?.ingestPath ?? '/integrations/attendance',
-      forwardingEnabled: patch.forwardingEnabled ?? existing?.forwardingEnabled ?? false,
+      name: patch.name.trim(),
+      provider: normalizeProvider(patch.provider),
+      baseUrl: patch.baseUrl?.trim() || null,
+      apiKeyEnc: patch.apiKey ? encryptSecret(patch.apiKey) : null,
+      webhookSecretEnc: patch.webhookSecret ? encryptSecret(patch.webhookSecret) : null,
+      pollerEnabled: patch.pollerEnabled ?? false,
+      intervalMin: patch.intervalMin ?? 15,
+      timeoutMs: patch.timeoutMs ?? 15000,
+      ingestBase: patch.ingestBase?.trim() || '/integrations/attendance',
+      forwardingEnabled: patch.forwardingEnabled ?? false,
+      isPrimary: patch.isPrimary ?? false,
+      isActive: patch.isActive ?? true,
     };
-    if (existing) {
-      await prisma.integrationConfig.update({ where: { id: 'default' }, data });
-    } else {
-      await prisma.integrationConfig.create({ data: { id: 'default', ...data } });
+    data.webhookSlug = await uniqueSlug(patch.webhookSlug || data.name);
+    if (data.isPrimary) {
+      await prisma.integration.updateMany({ where: { isPrimary: true }, data: { isPrimary: false } });
     }
-    refreshHrmsConfig();
+    const created = await prisma.integration.create({ data });
     await syncService.applyPollerConfig();
-    return hrmsConfig();
+    return integrationView(created);
   },
 
   /**
-   * Probe HRMS with given (or saved) credentials — powers the Test button.
-   * Hits HRMS's own connectivity endpoint first, then confirms the roster
+   * Update an integration (ADMIN). Secrets: undefined/'' keeps, explicit
+   * null clears. Applies immediately (poller restart), no restart needed.
+   */
+  async updateIntegration(id, patch) {
+    const existing = await getIntegration(id);
+    if (!existing) throw new AppError('Integration not found', 404, 'NOT_FOUND');
+    const data = {};
+    if (patch.name !== undefined) data.name = patch.name.trim();
+    if (patch.provider !== undefined) data.provider = normalizeProvider(patch.provider);
+    if (patch.baseUrl !== undefined) data.baseUrl = patch.baseUrl?.trim() || null;
+    if (patch.apiKey !== undefined) data.apiKeyEnc = keepSecret(patch.apiKey, existing.apiKeyEnc);
+    if (patch.webhookSecret !== undefined) data.webhookSecretEnc = keepSecret(patch.webhookSecret, existing.webhookSecretEnc);
+    if (patch.webhookSlug !== undefined) {
+      data.webhookSlug = patch.webhookSlug?.trim()
+        ? await uniqueSlug(patch.webhookSlug.trim(), id)
+        : null;
+    }
+    if (patch.pollerEnabled !== undefined) data.pollerEnabled = patch.pollerEnabled;
+    if (patch.intervalMin !== undefined) data.intervalMin = patch.intervalMin;
+    if (patch.timeoutMs !== undefined) data.timeoutMs = patch.timeoutMs;
+    if (patch.ingestBase !== undefined) data.ingestBase = patch.ingestBase?.trim() || '/integrations/attendance';
+    if (patch.forwardingEnabled !== undefined) data.forwardingEnabled = patch.forwardingEnabled;
+    if (patch.isActive !== undefined) data.isActive = patch.isActive;
+    if (patch.isPrimary !== undefined) data.isPrimary = patch.isPrimary;
+    if (data.isPrimary) {
+      await prisma.integration.updateMany({ where: { isPrimary: true, NOT: { id } }, data: { isPrimary: false } });
+    }
+    const updated = await prisma.integration.update({ where: { id }, data });
+    await syncService.applyPollerConfig();
+    return integrationView(updated);
+  },
+
+  /** Delete an integration (ADMIN). SyncLog rows survive (integrationId nulls). */
+  async deleteIntegration(id) {
+    const existing = await getIntegration(id);
+    if (!existing) throw new AppError('Integration not found', 404, 'NOT_FOUND');
+    await prisma.integration.delete({ where: { id } });
+    delete lastPollAt[id];
+    await syncService.applyPollerConfig();
+    return { deleted: true, id };
+  },
+
+  /**
+   * Probe an integration with given (or saved) credentials — powers the Test
+   * button. Hits the remote test endpoint first, then confirms the roster
    * pull. Never saves, never writes a SyncLog.
    */
-  async testConnection({ baseUrl, apiKey } = {}) {
-    const override = { baseUrl: baseUrl || undefined, apiKey: apiKey === undefined ? undefined : (apiKey || undefined) };
+  async testIntegration(id, { baseUrl, apiKey } = {}) {
+    const integration = id ? await getIntegration(id) : null;
+    const cfg = integration ? resolveIntegrationConfig(integration) : null;
+    const creds = {
+      baseUrl: baseUrl || cfg?.baseUrl || '',
+      apiKey: apiKey === undefined ? (cfg?.apiKey ?? '') : (apiKey || ''),
+      timeoutMs: cfg?.timeoutMs ?? 15000,
+      ingestBase: cfg?.ingestBase ?? '/integrations/attendance',
+    };
     try {
-      const probe = await testHrmsEndpoint(override);
-      if (!probe.ok) return { ok: false, message: `HRMS test endpoint: ${describeHrmsFailure(probe)}` };
-      const { total } = await fetchHrmsEmployees({ page: 1, limit: 1 }, override);
-      return { ok: true, total, message: `Connected — HRMS reachable, roster reports ${total} employee(s)` };
+      const probe = await testHrmsEndpoint(creds);
+      if (!probe.ok) return { ok: false, message: `Test endpoint: ${describeHrmsFailure(probe)}` };
+      const { total } = await fetchHrmsEmployees(creds, { page: 1, limit: 1 });
+      return { ok: true, total, message: `Connected — remote reachable, roster reports ${total} employee(s)` };
     } catch (e) {
       return { ok: false, message: e.message ?? 'Connection failed' };
     }
   },
 
-  /** Scheduled roster poller — interval comes from the runtime config. */
-  startPoller(intervalMin = 15) {
+  /**
+   * Scheduled roster poller — one 1-minute tick fans out to every enabled
+   * integration whose interval has elapsed. Tracks last-run per integration
+   * so mixed intervals (e.g. 5m + 60m) coexist on the single timer.
+   */
+  startPoller() {
     if (pollerTimer) return;
-    const safeMin = Math.max(1, Number(intervalMin || 15));
-    const intervalMs = safeMin * 60 * 1000;
-    console.log(`[sync] HRMS roster poller started (every ${safeMin} min)`);
-    pollerTimer = setInterval(() => {
-      syncService.runPoll({ triggeredBy: 'scheduler' }).catch((e) => console.error('[sync] poll failed:', e.message));
-    }, intervalMs);
-    // Initial pull shortly after boot.
+    console.log('[sync] integration roster poller started (1m tick)');
+    const tick = () => {
+      fetchIntegrations()
+        .then((rows) => {
+          const now = Date.now();
+          for (const row of rows) {
+            if (!row.isActive) continue;
+            const cfg = resolveIntegrationConfig(row);
+            if (!cfg.pollerEnabled) continue;
+            const intervalMs = Math.max(1, Number(cfg.intervalMin || 15)) * 60 * 1000;
+            if (now - (lastPollAt[row.id] ?? 0) < intervalMs) continue;
+            lastPollAt[row.id] = now;
+            syncService.runPoll({ integrationId: row.id, triggeredBy: 'scheduler' })
+              .catch((e) => console.error(`[sync] poll failed (${row.name}):`, e.message));
+          }
+        })
+        .catch((e) => console.error('[sync] poller tick failed:', e.message));
+    };
+    pollerTimer = setInterval(tick, 60 * 1000);
+    // Initial pulls shortly after boot, staggered to avoid thundering.
     setTimeout(() => {
-      syncService.runPoll({ triggeredBy: 'scheduler' }).catch((e) => console.error('[sync] initial poll failed:', e.message));
-    }, 5000);
+      fetchIntegrations()
+        .then((rows) => {
+          const enabled = rows.filter((r) => {
+            if (!r.isActive) return false;
+            return resolveIntegrationConfig(r).pollerEnabled;
+          });
+          enabled.forEach((row, i) => {
+            setTimeout(() => {
+              lastPollAt[row.id] = Date.now();
+              syncService.runPoll({ integrationId: row.id, triggeredBy: 'scheduler' })
+                .catch((e) => console.error(`[sync] initial poll failed (${row.name}):`, e.message));
+            }, 5000 + i * 5000);
+          });
+        })
+        .catch((e) => console.error('[sync] initial poll failed:', e.message));
+    }, 1000);
   },
 
-  /** Reconcile the poller with the runtime config (called on boot + every save). */
+  /** Reconcile the poller with the saved integrations (boot + every save). */
   async applyPollerConfig() {
-    const cfg = await hrmsConfig();
-    if (cfg.pollerEnabled) {
-      syncService.stopPoller();
-      syncService.startPoller(cfg.intervalMin);
+    const rows = await fetchIntegrations().catch(() => []);
+    const anyEnabled = rows.some((r) => r.isActive && resolveIntegrationConfig(r).pollerEnabled);
+    if (anyEnabled) {
+      syncService.startPoller();
     } else {
       syncService.stopPoller();
     }
@@ -411,51 +530,65 @@ export const syncService = {
   },
 
   /**
-   * Outbound delivery (choice B: this app collects punches, HRMS computes).
-   * Routes each local event into HRMS's ingestion shapes (x-api-key,
-   * scope attendance:ingest): single punches -> POST .../punch, corrections
-   * and backfills -> POST .../bulk.
+   * Outbound delivery (choice B: this app collects punches, the remote system
+   * computes). Fans out to every active integration with forwarding enabled,
+   * routing each local event into HRMS ingestion shapes (x-api-key, scope
+   * attendance:ingest): single punches -> POST .../punch, corrections and
+   * backfills -> POST .../bulk.
    *
-   * Idempotency: every outbound API call is keyed by a deterministic hash of the
-   * HRMS-shaped body + Manila day. A retry (or a duplicate fireForwardToHrms)
-   * whose key already has a SUCCESS SyncLog is skipped — HRMS never sees the
-   * same punch/correction twice. Transient failures (network, 5xx, 429, 408)
-   * are retried with exponential backoff; only a terminal, non-retryable error
-   * (or exhaustion of retries) writes a FAILED log, which intentionally omits
-   * the key so a later manual retry can still succeed.
+   * Idempotency: every outbound API call is keyed by integration + body hash
+   * + Manila day (see deriveIdempotencyKey). A retry (or a duplicate forward)
+   * whose key already has a SUCCESS SyncLog is skipped — the remote system
+   * never sees the same punch/correction twice. Transient failures (network,
+   * 5xx, 429, 408) are retried with exponential backoff; only a terminal,
+   * non-retryable error (or exhaustion of retries) writes a FAILED log, which
+   * intentionally omits the key so a later manual retry can still succeed.
    *
-   * HRMS-originated webhook punches are NEVER echoed back here (loop
-   * prevention) — HRMS already holds them.
+   * Remotely-originated webhook punches are NEVER echoed back (loop
+   * prevention) — the origin already holds them.
    */
-  async forwardToHrms({ event, payload }) {
-    const cfg = await hrmsConfig();
-    if (!cfg.attendanceForwarding) return { skipped: true };
+  async forwardToIntegrations({ event, payload }) {
+    const integrations = (await fetchIntegrations()).filter((row) => {
+      if (!row.isActive) return false;
+      return resolveIntegrationConfig(row).forwarding;
+    });
+    if (integrations.length === 0) return { skipped: true, results: [] };
+    const results = [];
+    for (const integration of integrations) {
+      results.push(await syncService.forwardToIntegration(integration, { event, payload }));
+    }
+    const ok = results.every((r) => r.ok);
+    return { ok, results };
+  },
+
+  /** Forward one event to one integration (see forwardToIntegrations). */
+  async forwardToIntegration(integration, { event, payload }) {
     try {
       let calls;
       let label;
       if (event === 'correction' || event === 'mark_absent') {
-        // Bulk ingestion: one HRMS call carrying all records.
+        // Bulk ingestion: one remote call carrying all records.
         const records = toHrmsBulkRecords(event, payload);
-         calls = records.length > 0
-          ? [{ method: (b) => postHrmsBulk(b), hrmsBody: { records } }]
+        calls = records.length > 0
+          ? [{ method: (c, b) => postHrmsBulk(c, b), hrmsBody: { records } }]
           : [{ method: () => Promise.resolve({ ok: true, status: 200, body: 'nothing to forward' }), hrmsBody: { records: [] } }];
         label = `${records.length} record(s) (${event})`;
       } else {
-        // Per-punch ingestion: each punch is its own HRMS call so a deduped
+        // Per-punch ingestion: each punch is its own remote call so a deduped
         // or retried punch is isolated (no clobbering a sibling's success).
         const punches = toHrmsPunches(event, payload);
-        calls = punches.map((punch) => ({ method: (b) => postHrmsPunch(b), hrmsBody: punch }));
+        calls = punches.map((punch) => ({ method: (c, b) => postHrmsPunch(c, b), hrmsBody: punch }));
         label = `${punches.length} punch(es) (${event})`;
       }
 
-      const outcomes = await Promise.all(calls.map((c) => sendOnceWithRetry(c.method, event, c.hrmsBody)));
+      const outcomes = await Promise.all(calls.map((c) => sendOnceWithRetry(integration, c.method, event, c.hrmsBody)));
       const deduped = outcomes.filter((r) => r.deduped).length;
       const failed = outcomes.filter((r) => !r.ok);
       const result = failed.length === 0
         ? { ok: true, status: 200, body: outcomes.map((r) => r.body), deduped }
         : { ok: false, status: failed[0].status, body: failed.map((r) => r.body), deduped };
 
-      // One SyncLog per HRMS API call so the idempotency key resolves to a
+      // One SyncLog per remote API call so the idempotency key resolves to a
       // single SUCCESS row per logical forward (no PK/unique collisions).
       for (const out of outcomes) {
         const isSuccess = out.ok;
@@ -463,28 +596,31 @@ export const syncService = {
         await syncRepository.create({
           source: 'WEBHOOK',
           direction: 'OUTBOUND',
+          integrationId: integration.id,
           event,
           status: isSuccess ? 'SUCCESS' : 'FAILED',
           processed: out.deduped ? 0 : 1,
           message: isSuccess
-            ? (isDeduped ? `Forwarded ${label} to HRMS (deduped — already sent)` : `Forwarded ${label} to HRMS`)
-            : `HRMS forward failed (${out.status}) after ${out.attempt} attempt(s): ${String(typeof out.body === 'string' ? out.body : JSON.stringify(out.body)).slice(0, 200)}`,
+            ? (isDeduped ? `Forwarded ${label} to ${integration.name} (deduped — already sent)` : `Forwarded ${label} to ${integration.name}`)
+            : `Forward to ${integration.name} failed (${out.status}) after ${out.attempt} attempt(s): ${String(typeof out.body === 'string' ? out.body : JSON.stringify(out.body)).slice(0, 200)}`,
           payload: { ok: out.ok, status: out.status, deduped: out.deduped, attempt: out.attempt },
           idempotencyKey: isSuccess ? out.idempotencyKey : null,
         });
       }
-      return result;
+      return { ...result, integrationId: integration.id };
     } catch (e) {
       await syncRepository.create({
         source: 'WEBHOOK',
         direction: 'OUTBOUND',
+        integrationId: integration.id,
         event,
         status: 'FAILED',
         processed: (payload && payload.punches?.length) ?? 1,
-        message: `HRMS forward error: ${e.message}`,
+        message: `Forward to ${integration.name} error: ${e.message}`,
         payload: { error: e.code ?? e.message },
       });
-      return { ok: false, status: 0, body: e.message };
+      return { ok: false, status: 0, body: e.message, integrationId: integration.id };
     }
   },
 };
+

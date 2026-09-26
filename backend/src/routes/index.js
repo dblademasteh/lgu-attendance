@@ -5,16 +5,18 @@ import { auditLog } from '../middleware/audit.js';
 import { webhookLimiter } from '../middleware/rateLimit.js';
 import { validate } from '../middleware/validate.js';
 import { requireApiKey } from '../middleware/apiKey.js';
-import { verifyHrmsSignature, isIntegrationIpAllowed, getHrmsConfig } from '../lib/hrms.js';
+import { verifyHrmsSignature, isIntegrationIpAllowed } from '../lib/hrms.js';
+import { getIntegrationBySlug, resolveIntegrationConfig } from '../lib/integrations.js';
 import { syncService } from '../services/syncService.js';
 import { AppError } from '../lib/errors.js';
-import { webhookSchema } from '../shared/contracts/sync.js';
+import { webhookSchema, webhookSlugSchema } from '../shared/contracts/sync.js';
 import { pullPunchesSchema } from '../shared/contracts/apiKeys.js';
 import authRouter from './auth.js';
 import employeesRouter from './employees.js';
 import attendanceRouter from './attendance.js';
 import reportsRouter from './reports.js';
 import syncRouter from './sync.js';
+import integrationsRouter from './integrations.js';
 import apiKeysRouter from './apiKeys.js';
 import externalRouter from './external.js';
 import * as externalController from '../controllers/externalController.js';
@@ -26,27 +28,34 @@ const router = Router();
 // Public: JWT auth (login/refresh) — rate-limited on credentials.
 router.use('/auth', authRouter);
 
-// Public webhook receiver — no JWT. Secured by HMAC-SHA256 signature in the
+// Public webhook receiver — no JWT. Each integration has its own receiver
+// path (POST /webhooks/:slug); the legacy /webhooks/hrms path is the
+// primary integration's slug. Secured per-integration by HMAC-SHA256 in the
 // X-HRMS-Signature header (computed over the raw body), optional IP
 // allowlist (INTEGRATION_ALLOWED_IPS), 30 req/min/IP.
-router.post('/webhooks/hrms', webhookLimiter, async (req, res, next) => {
+router.post('/webhooks/:slug', webhookLimiter, validate(webhookSlugSchema), async (req, res, next) => {
   try {
+    const integration = await getIntegrationBySlug(req.params.slug);
+    if (!integration || !integration.isActive) {
+      throw new AppError('Unknown integration', 404, 'UNKNOWN_INTEGRATION');
+    }
     if (!isIntegrationIpAllowed(req)) {
       throw new AppError('Caller IP is not allowed', 403, 'IP_NOT_ALLOWED');
     }
     // Secret resolved per-request: hot-swappable via Settings > Integration.
-    const secret = (await getHrmsConfig()).webhookSecret;
+    const secret = resolveIntegrationConfig(integration).webhookSecret;
     const signature = req.headers['x-hrms-signature'];
     if (!verifyHrmsSignature(req.rawBody, signature, secret)) {
       throw new AppError('Invalid webhook signature', 401, 'INVALID_SIGNATURE');
     }
+    req.integration = integration;
     return next();
   } catch (e) {
     return next(e);
   }
 }, validate(webhookSchema), async (req, res, next) => {
   try {
-    const result = await syncService.processWebhook(req.body);
+    const result = await syncService.processWebhook(req.body, req.integration);
     return res.json({ ok: true, ...result });
   } catch (e) {
     return next(e);
@@ -75,6 +84,7 @@ router.use('/employees', employeesRouter);
 router.use('/attendance', attendanceRouter);
 router.use('/reports', reportsRouter);
 router.use('/sync', syncRouter);
+router.use('/integrations', integrationsRouter);
 router.use('/api-keys', apiKeysRouter);
 // Device management (ADMIN/HR_MANAGER): register / configure / manage the
 // biometric terminals this app serves as the server for.

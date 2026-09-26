@@ -2,7 +2,6 @@ import { attendanceService } from '../services/attendanceService.js';
 import { syncService } from '../services/syncService.js';
 import { biometricDeviceRepository } from '../repositories/biometricDeviceRepository.js';
 import { AppError } from '../lib/errors.js';
-import { hrmsConfig } from '../lib/hrms.js';
 
 /**
  * Device-facing punch ingestion. Devices are clients of this app (the server):
@@ -38,12 +37,13 @@ export async function receivePunches(req, res, next) {
     }
     const processed = results.reduce((n, r) => n + r.processed, 0);
 
-    // Choice B: forward the raw punches to HRMS for computation.
-    if (processed > 0 && (await hrmsConfig()).attendanceForwarding) {
-      syncService.forwardToHrms({
+    // Choice B: forward the raw punches to every forwarding-enabled
+    // integration for computation.
+    if (processed > 0) {
+      syncService.forwardToIntegrations({
         event: 'biometric.punch_batch',
         payload: { deviceId: req.device.deviceId, punches },
-      }).catch((e) => console.error('[device] HRMS forward failed:', e.message));
+      }).catch((e) => console.error('[device] forward failed:', e.message));
     }
 
     return res.status(200).json({

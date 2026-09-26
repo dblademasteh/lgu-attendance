@@ -20,6 +20,10 @@ export const syncRepository = {
   async latest() {
     return prisma.syncLog.findFirst({ orderBy: { createdAt: 'desc' } });
   },
+  async latestFor(integrationId) {
+    if (!integrationId) return null;
+    return prisma.syncLog.findFirst({ where: { integrationId }, orderBy: { createdAt: 'desc' } });
+  },
   async counts() {
     const rows = await prisma.syncLog.groupBy({ by: ['status'], _count: { _all: true } });
     return rows.map((r) => ({ status: r.status, count: r._count._all }));

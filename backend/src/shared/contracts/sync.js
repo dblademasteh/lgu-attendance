@@ -51,34 +51,20 @@ export const listSyncLogsSchema = z.object({
     status: z.enum(['SUCCESS', 'PARTIAL', 'FAILED']).optional(),
     source: z.enum(['WEBHOOK', 'POLL']).optional(),
     direction: z.enum(['INBOUND', 'PULL', 'OUTBOUND']).optional(),
+    integrationId: z.string().uuid().optional(),
   }),
 });
 
-/**
- * In-app HRMS connection config (ADMIN only — secrets involved). Secrets:
- * undefined/'' keeps the saved value, explicit null clears back to env.
- * baseUrl: undefined keeps, ''/null clears back to env.
- */
-export const updateSyncConfigSchema = z.object({
+/** Manual roster pull for one integration (body.integrationId optional → primary). */
+export const runIntegrationSyncSchema = z.object({
   body: z.object({
-    baseUrl: z.string().trim().max(200).nullish().refine(
-      (v) => v == null || v === '' || /^https?:\/\//.test(v),
-      { message: 'Base URL must start with http:// or https://' },
-    ),
-    apiKey: z.string().max(500).nullish(),
-    webhookSecret: z.string().max(500).nullish(),
-    pollerEnabled: z.boolean().optional(),
-    intervalMin: z.number().int().min(1).max(1440).optional(),
-    timeoutMs: z.number().int().min(1000).max(120000).optional(),
-    ingestPath: z.string().trim().max(200).optional(),
-    forwardingEnabled: z.boolean().optional(),
+    integrationId: z.string().uuid().optional(),
   }),
 });
 
-/** Probe credentials without saving (Test button). Blank = use saved values. */
-export const testSyncConnectionSchema = z.object({
-  body: z.object({
-    baseUrl: z.string().trim().max(200).optional(),
-    apiKey: z.string().max(500).optional(),
+/** Webhook receiver path segment — one per integration (legacy 'hrms' kept). */
+export const webhookSlugSchema = z.object({
+  params: z.object({
+    slug: z.string().min(1).max(64),
   }),
 });
